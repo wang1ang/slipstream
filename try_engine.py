@@ -1,6 +1,8 @@
 """Interactive REPL to feel batched speculative decoding. Loads the model once.
 
-    python try_engine.py [--model PATH] [--raw] [-n N]
+    python try_engine.py [--model PATH] [--raw] [-n N] [-d DEPTH]
+
+-d is the draft depth k (tokens drafted per step); d=0 is pure AR (no draft).
 
 Enter prompts one per line; a BLANK line runs them together (batched speculative,
 take-min aligned). Greedy; each row's output == plain AR. Commands:
@@ -45,7 +47,7 @@ def run(eng, drafter, prompts, cfg):
     t0 = time.time()
     if B > 1:
         print(f"--- prompt 1: {prompts[0][:50]!r}")
-    for step in speculative_generate_batch(eng, drafter, ids, max_tokens=cfg["n"], k=4):
+    for step in speculative_generate_batch(eng, drafter, ids, max_tokens=cfg["n"], k=cfg["k"]):
         for i in range(B):
             produced[i].extend(step[i])
         full = eng.decode(produced[0])          # stream row 0
@@ -67,13 +69,15 @@ def main() -> int:
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
+    ap.add_argument("-d", "--depth", type=int, default=1,
+                    help="draft depth k (tokens drafted per step)")
     args = ap.parse_args()
 
     eng = Engine(args.model)
     print(f"[loaded in {eng.load_seconds:.1f}s, loading MTP head...]")
-    drafter = Drafter(eng, MTP)
+    drafter = Drafter(eng, MTP, bits=4)
 
-    cfg = {"n": args.max_tokens, "raw": args.raw}
+    cfg = {"n": args.max_tokens, "raw": args.raw, "k": args.depth}
     buf = []
 
     while True:

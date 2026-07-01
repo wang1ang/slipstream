@@ -71,7 +71,7 @@ class MTPHead(nn.Module):
 class Drafter:
     """Loads the MTP head and drafts tokens against a trunk model."""
 
-    def __init__(self, engine, mtp_path: str):
+    def __init__(self, engine, mtp_path: str, bits: int | None = None):
         self.engine = engine
         trunk = engine.model.language_model
         self.embed = trunk.model.embed_tokens
@@ -90,6 +90,10 @@ class Drafter:
         for _, m in self.head.named_modules():
             if isinstance(m, nn.RMSNorm):
                 m.weight = m.weight + 1.0
+        # Optionally quantize the head's Linear/MoE weights (faster draft, slight
+        # accuracy loss). RMSNorm is left untouched by nn.quantize.
+        if bits is not None:
+            nn.quantize(self.head, bits=bits)
         self.head.eval()
 
     def make_cache(self) -> list:
@@ -103,6 +107,8 @@ class Drafter:
         Chains the head: each step feeds the head's own previous hidden and the
         token it just drafted.
         """
+        if k == 0:                                  # no draft -> pure AR
+            return mx.zeros((tokens.shape[0], 0), dtype=tokens.dtype)
         h = hidden
         tok = tokens[:, None]                       # [B, 1]
         drafts = []
