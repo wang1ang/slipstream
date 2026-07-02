@@ -27,6 +27,7 @@ Correctness facts (verified by experiment):
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -53,6 +54,17 @@ class Engine:
     """Loads a model. Runs correct batched forwards. Nothing else."""
 
     def __init__(self, model_path: str):
+        # A local-path argument that doesn't exist would otherwise be treated as
+        # an HF repo id and fail with an opaque huggingface validation error —
+        # catch it here with a clear message. Only absolute (/…) or home/relative
+        # (~ ./ ../) forms are treated as local paths; a bare "namespace/repo" is
+        # a valid HF id and is left for mlx-lm to download.
+        looks_local = model_path.startswith(("/", "~", "./", "../"))
+        if looks_local:
+            expanded = os.path.expanduser(model_path)
+            if not os.path.isdir(expanded):
+                raise FileNotFoundError(f"model directory not found: {expanded}")
+            model_path = expanded
         t0 = time.time()
         self.model, self.tokenizer = load(model_path)
         self.model_path = model_path
@@ -71,8 +83,13 @@ class Engine:
         return set(self.tokenizer.eos_token_ids)
 
     def logits(self, hidden: mx.array) -> mx.array:
-        """Trunk lm_head over hidden -> logits ``[..., vocab]``."""
-        return self.model.language_model.lm_head(hidden)
+        """Trunk head over hidden -> logits ``[..., vocab]``. Mirrors mlx-lm's
+        own tie handling: tied models project through the embedding, untied use
+        a separate lm_head."""
+        lm = self.model.language_model
+        if lm.args.tie_word_embeddings:
+            return lm.model.embed_tokens.as_linear(hidden)
+        return lm.lm_head(hidden)
 
     # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
     def prefill(self, prompts: list[list[int]]) -> tuple[BatchState, mx.array]:

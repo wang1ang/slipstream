@@ -6,17 +6,23 @@ draft k tokens per row, verify with the trunk, accept each row's longest correct
 prefix, take the min across rows so caches stay aligned. B=1 is just a batch of 1
 — there is no separate single-sequence path (no routing in this layer).
 
-The head (qwen3_5_moe) is one full-attention transformer layer:
+The head is one full-attention transformer layer:
     [embed(next_token) ‖ trunk_hidden]  (each RMS-normed)
-      -> fc (4096->2048)
-      -> DecoderLayer (self-attn + MoE), reusing the trunk's layer class
+      -> fc (2H -> H)
+      -> DecoderLayer, REUSING the trunk's own layer class (dense or MoE,
+         whichever the trunk is — nothing model-specific is hardcoded here)
       -> norm
-      -> trunk lm_head   (weights reused from the trunk)
+      -> trunk output head (engine.logits: tied embedding or lm_head)
+The head loads generically from config: MoE vs dense follows the trunk, and a
+prequantized head is quantized to the config's scheme before load (see Drafter).
 Its KV cache is a plain KVCache (pure attention, no SSM), independent of the
 trunk cache.
 """
 
 from __future__ import annotations
+
+import os
+import json
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -43,6 +49,17 @@ def _stack_experts(weights: dict, n_experts: int) -> dict:
     for key, by_idx in per_expert.items():
         out[key] = mx.stack([by_idx[i] for i in range(n_experts)])
     return out
+
+
+def _quant_config(model_path: str) -> dict:
+    """Default quantization scheme from the model's config.json. The block sits
+    at the TOP level (not text_config), and mlx-lm drops it after load, so read
+    the file. Mixed per-layer specs share the block; top-level = the default."""
+    with open(os.path.join(model_path, "config.json")) as f:
+        q = (json.load(f).get("quantization") or {})
+    return {"group_size": int(q.get("group_size", 64)),
+            "bits": int(q.get("bits", 4)),
+            "mode": str(q.get("mode", "affine"))}
 
 
 class MTPHead(nn.Module):
@@ -75,14 +92,38 @@ class Drafter:
         self.engine = engine
         trunk = engine.model.language_model
         self.embed = trunk.model.embed_tokens
-        self.lm_head = trunk.lm_head
-        targs = q5.TextModelArgs.from_dict(engine.model.args.text_config)
+        # Draft logits reuse the trunk head via engine.logits (handles tied /
+        # untied); the head shares the trunk's output projection.
+        cfg = engine.model.args.text_config
+        targs = q5.TextModelArgs.from_dict(cfg)
         self.head = MTPHead(targs)
 
         raw = mx.load(mtp_path)
         weights = {k[len("mtp."):]: v for k, v in raw.items() if k.startswith("mtp.")}
-        weights = _stack_experts(weights, targs.num_experts)
-        self.head.load_weights(list(weights.items()), strict=True)
+        # MoE trunks store per-expert weights; stack them. Dense heads have no
+        # experts (num_experts falsy) — nothing to stack.
+        if getattr(targs, "num_experts", None):
+            weights = _stack_experts(weights, targs.num_experts)
+
+        # A prequantized head ships .scales/.biases; those exact modules must be
+        # quantized to the SAME scheme BEFORE loading (mirrors mlx-lm's quantized
+        # load). Quantization is MIXED — only the modules that actually carry a
+        # .scales weight are quantized (e.g. fc / norms stay full precision), so
+        # drive it by a predicate over the weight keys, not a blanket quantize.
+        prequant = any(k.endswith(".scales") for k in weights)
+        if prequant:
+            qc = _quant_config(engine.model_path)
+            scaled = {k[: -len(".scales")] for k in weights if k.endswith(".scales")}
+
+            def is_quantized(path, _module):
+                return path in scaled and {"group_size": qc["group_size"],
+                                           "bits": qc["bits"], "mode": qc["mode"]}
+
+            nn.quantize(self.head, class_predicate=is_quantized)
+
+        # strict=False: heads vary by architecture (dense vs MoE, quantized or
+        # not); load what matches and let the module keep its untouched norms.
+        self.head.load_weights(list(weights.items()), strict=False)
         # This model's RMSNorm uses the (1 + weight) convention: the checkpoint
         # stores weight-1, and the forward computes (1 + w) * x. mlx-lm's nn.RMSNorm
         # is plain w * x, so add 1 to every norm weight in the head. (The trunk is
@@ -90,9 +131,9 @@ class Drafter:
         for _, m in self.head.named_modules():
             if isinstance(m, nn.RMSNorm):
                 m.weight = m.weight + 1.0
-        # Optionally quantize the head's Linear/MoE weights (faster draft, slight
-        # accuracy loss). RMSNorm is left untouched by nn.quantize.
-        if bits is not None:
+        # A non-prequantized head can be quantized here (faster draft, slight
+        # accuracy loss); prequantized heads are already quantized above.
+        if bits is not None and not prequant:
             nn.quantize(self.head, bits=bits)
         self.head.eval()
 
@@ -123,7 +164,7 @@ class Drafter:
         drafts = []
         for _ in range(k):
             post = self.head(self.embed(tok), h, cache[0])   # [B, 1, H]
-            tok = mx.argmax(self.lm_head(post)[:, -1, :], axis=-1)[:, None]  # [B, 1]
+            tok = mx.argmax(self.engine.logits(post)[:, -1, :], axis=-1)[:, None]  # [B, 1]
             drafts.append(tok)
             h = post
         return mx.concatenate(drafts, axis=1)

@@ -70,7 +70,9 @@ class Hub:
     def _run(self):
         c = self._cfg
         self.eng = Engine(c["model_path"])
-        self.drafter = Drafter(self.eng, c["mtp_path"], bits=c["bits"])
+        # No MTP head path -> run pure AR (scheduler forces k=0).
+        self.drafter = (Drafter(self.eng, c["mtp_path"], bits=c["bits"])
+                        if c["mtp_path"] is not None else None)
         self._sched = Scheduler(self.eng, self.drafter,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"])
         self._ready.set()

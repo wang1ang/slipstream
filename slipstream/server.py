@@ -187,7 +187,14 @@ def make_handler(backend: Hub):
     return Handler
 
 
-def serve(model_path: str, mtp_path: str, host="127.0.0.1", port=8000, bits=4):
+def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000, bits=4):
+    # mtp_path None -> derive <model>/mtp.safetensors; "" -> force headless.
+    if mtp_path is None:
+        mtp_path = os.path.join(model_path, "mtp.safetensors")
+    # Absent head file (derived or explicit) -> serve the plain model as pure AR.
+    if not mtp_path or not os.path.exists(mtp_path):
+        mtp_path = None
+    print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
     backend = Hub(model_path, mtp_path, bits=bits)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
@@ -201,7 +208,8 @@ if __name__ == "__main__":
     MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
-    ap.add_argument("--mtp", default=MODEL + "/mtp.safetensors")
+    # Default: derive <model>/mtp.safetensors (present -> speculate, absent -> AR).
+    ap.add_argument("--mtp", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()

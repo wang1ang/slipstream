@@ -45,10 +45,11 @@ class PrefillGroup:
 
 
 class Scheduler:
-    def __init__(self, engine: Engine, drafter: Drafter, *, k=1, chunk=512, debug=False):
+    def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512, debug=False):
         self.eng = engine
         self.dr = drafter
-        self.k = k
+        # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
+        self.k = k if drafter is not None else 0
         self.chunk = chunk
         self.eos = engine.eos_token_ids
         self.debug = debug
@@ -58,7 +59,7 @@ class Scheduler:
         self.state: BatchState | None = None
         self.h = None
         self.primary = None
-        self.dcache = drafter.make_cache()
+        self.dcache = drafter.make_cache() if drafter is not None else None
         self.rows: list[Req] = []      # row i -> Req
 
     def _log(self, msg):
@@ -121,7 +122,8 @@ class Scheduler:
         self.h = mx.concatenate(hs, axis=0)
         self.primary = mx.concatenate(prims, axis=0)
         self.rows = reqs
-        self.dcache = self.dr.make_cache()
+        if self.dr is not None:                    # merge resets the draft cache
+            self.dcache = self.dr.make_cache()
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
 
@@ -134,8 +136,11 @@ class Scheduler:
         state, h, primary, rows = self.state, self.h, self.primary, self.rows
         B = len(rows)
 
-        drafts = dr.draft(h, primary, k, self.dcache)
-        draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
+        if k == 0:                                  # no head -> no draft
+            draft_ids = [[] for _ in range(B)]
+        else:
+            drafts = dr.draft(h, primary, k, self.dcache)
+            draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
 
         snap = eng.snapshot_ssm(state)
         lengths_before = list(state.lengths)
@@ -182,13 +187,14 @@ class Scheduler:
             keep = [i for i in range(B) if i not in finished]
             if keep:
                 eng.filter(self.state, keep)
-                dr.filter_cache(self.dcache, keep)
+                if dr is not None:
+                    dr.filter_cache(self.dcache, keep)
                 self.primary = self.primary[mx.array(keep)]
                 self.h = self.h[mx.array(keep)]
                 self.rows = [rows[i] for i in keep]
             else:
                 self.state = self.h = self.primary = None
                 self.rows = []
-                self.dcache = dr.make_cache()
+                self.dcache = dr.make_cache() if dr is not None else None
 
         return emitted

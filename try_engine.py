@@ -24,10 +24,15 @@ from prompt_toolkit.document import Document
 
 from slipstream.engine import Engine
 from slipstream.mtp import Drafter
-from slipstream.scheduler import Scheduler
+from slipstream.scheduler import Scheduler, Req, PrefillGroup
 
 MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
-MTP = MODEL + "/mtp.safetensors"
+
+
+def find_mtp(model_path):
+    """MTP head lives beside the model as mtp.safetensors; absent -> headless."""
+    p = os.path.join(model_path, "mtp.safetensors")
+    return p if os.path.exists(p) else None
 
 
 def to_ids(eng, text, raw):
@@ -47,9 +52,10 @@ def main() -> int:
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    print("[loading model + MTP head...]")
+    mtp = find_mtp(args.model)
+    print(f"[loading model{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
     eng = Engine(args.model)
-    drafter = Drafter(eng, MTP, bits=4)
+    drafter = Drafter(eng, mtp, bits=4) if mtp else None
     sch = Scheduler(eng, drafter, k=args.depth, chunk=512, debug=args.debug)
 
     prompts = {}         # rid -> prompt text
@@ -80,10 +86,21 @@ def main() -> int:
         focused_element=input_win,
     )
 
+    next_rid = [0]
+
     def add(text):
-        rid = sch.add(to_ids(eng, text, args.raw), args.max_tokens)
+        rid = next_rid[0]
+        next_rid[0] += 1
         prompts[rid] = text
         produced_text[rid] = ""
+        # Prefill the new request and merge it into the live batch (入). The
+        # merge returns each joined request's FIRST token — show it now (it is
+        # not part of the next step()'s output).
+        group = PrefillGroup(reqs=[Req(rid, to_ids(eng, text, args.raw), args.max_tokens)])
+        while not sch.prefill_chunk(group):
+            pass
+        for r, first in sch.merge_ready(group):
+            produced_text[r] += eng.decode([first])
         render()
 
     kb = KeyBindings()
@@ -107,7 +124,7 @@ def main() -> int:
     async def driver():
         # one scheduler step per loop iteration; yield to the UI between steps
         while True:
-            if sch.active():
+            if sch.has_rows():
                 for rid, toks in sch.step():
                     produced_text[rid] = produced_text.get(rid, "") + eng.decode(toks)
                 render()
