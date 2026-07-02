@@ -46,9 +46,7 @@ class Hub:
 
     # --- API side (any HTTP thread) -----------------------------------------
     def prompt_ids(self, messages):
-        return self.eng.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
-        )
+        return self.eng.apply_chat_template(messages)
 
     def stream_text(self, prompt_ids, max_tokens):
         """Yield decoded text deltas for one request until it finishes."""

@@ -38,6 +38,23 @@ from mlx_lm.generate import _make_cache, _right_pad_prompts
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 
+# A "developer" message IS a system message in OpenAI's newer API — a semantic
+# rename, applied always (independent of any model). Any other role a template
+# rejects is left to raise: no silent downgrade (surface the problem).
+_ROLE_SYNONYMS = {"developer": "system"}
+
+
+def _consolidate_system(messages: list[dict]) -> list[dict]:
+    """Join all system messages into a single one at the front, keeping the rest
+    in order. Chat templates require the system message to be first, but Codex
+    (Responses API) interleaves system/developer frames between user turns."""
+    system = [str(m.get("content", "")) for m in messages if m["role"] == "system"]
+    rest = [m for m in messages if m["role"] != "system"]
+    if not system:
+        return messages
+    return [{"role": "system", "content": "\n\n".join(s for s in system if s)}] + rest
+
+
 def find_mtp(model_path: str) -> str | None:
     """The MTP head sits beside the model as mtp.safetensors; return its path,
     or None if absent (the model then runs pure AR / headless)."""
@@ -80,6 +97,17 @@ class Engine:
     # --- tokenization ---
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
+
+    def apply_chat_template(self, messages: list[dict]) -> list[int]:
+        """Render messages to prompt token ids. developer -> system (OpenAI's
+        newer API), then every system message is consolidated into one at the
+        front: Codex interleaves developer/system frames between user turns, and
+        templates require system-first. Content is preserved (joined), not
+        dropped. Any other role passes through; a template rejecting it raises."""
+        msgs = [{**m, "role": _ROLE_SYNONYMS.get(m.get("role"), m.get("role") or "user")}
+                for m in messages]
+        msgs = _consolidate_system(msgs)
+        return self.tokenizer.apply_chat_template(msgs, add_generation_prompt=True)
 
     def decode(self, token_ids: list[int]) -> str:
         # skip_special_tokens drops <|im_end|>/<|endoftext|> etc from the text.

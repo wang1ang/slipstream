@@ -37,11 +37,16 @@ def _hex(prefix):
 
 
 def _messages_from_chat(body):
+    # Roles are normalized to the model's template downstream (Engine), so L5
+    # only translates wire shape here — it passes roles through verbatim.
     return list(body.get("messages", []))
 
 
 def _messages_from_responses(body):
-    """Responses: optional `instructions` (system) + `input` (str or items)."""
+    """Responses: optional `instructions` (system) + `input` (str or items).
+    Roles are passed through verbatim (developer frames included); role mapping
+    and system consolidation happen downstream in Engine.apply_chat_template.
+    """
     msgs = []
     if body.get("instructions"):
         msgs.append({"role": "system", "content": body["instructions"]})
