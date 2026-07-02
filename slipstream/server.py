@@ -193,7 +193,8 @@ def make_handler(backend: Hub):
     return Handler
 
 
-def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000, bits=4):
+def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
+          bits=4, debug=False):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
@@ -201,7 +202,7 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000, bi
     elif not os.path.exists(mtp_path):
         mtp_path = None
     print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
-    backend = Hub(model_path, mtp_path, bits=bits)
+    backend = Hub(model_path, mtp_path, bits=bits, debug=debug)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
           f"(/v1/chat/completions, /v1/responses, /v1/models)]")
@@ -221,6 +222,8 @@ if __name__ == "__main__":
     ap.add_argument("--mtp", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--debug", action="store_true",
+                    help="log scheduler activity (prefill/join/advance/exit)")
     args = ap.parse_args()
 
     # registry.select behaves per-environment: a server run without a tty gets
@@ -229,4 +232,4 @@ if __name__ == "__main__":
         entry = registry.select(args.model)
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         sys.exit(str(e))
-    serve(entry.path, args.mtp, host=args.host, port=args.port)
+    serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug)
