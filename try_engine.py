@@ -22,11 +22,10 @@ from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
 
+from slipstream import registry
 from slipstream.engine import Engine, find_mtp
 from slipstream.mtp import Drafter
 from slipstream.scheduler import Scheduler, Req, PrefillGroup
-
-MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
 
 
 def to_ids(eng, text, raw):
@@ -39,16 +38,18 @@ def to_ids(eng, text, raw):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--model", default=None,
+                    help="model path or name; default: scan ~/.mtplx/models")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
     ap.add_argument("-d", "--depth", type=int, default=1)
     ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
-    mtp = find_mtp(args.model)
-    print(f"[loading model{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
-    eng = Engine(args.model)
+    entry = registry.select(args.model)
+    mtp = find_mtp(entry.path)
+    print(f"[loading {entry.name}{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
+    eng = Engine(entry.path)
     drafter = Drafter(eng, mtp, bits=4) if mtp else None
     sch = Scheduler(eng, drafter, k=args.depth, chunk=512, debug=args.debug)
 

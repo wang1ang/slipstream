@@ -205,13 +205,23 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000, bi
 
 if __name__ == "__main__":
     import argparse
+    import sys
 
-    MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
+    from . import registry
+
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default=MODEL)
+    ap.add_argument("--model", default=None,
+                    help="model path or name; default: scan ~/.mtplx/models")
     # Default: derive <model>/mtp.safetensors (present -> speculate, absent -> AR).
     ap.add_argument("--mtp", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     args = ap.parse_args()
-    serve(args.model, args.mtp, host=args.host, port=args.port)
+
+    # registry.select behaves per-environment: a server run without a tty gets
+    # the "list + pick with --model" error instead of an interactive prompt.
+    try:
+        entry = registry.select(args.model)
+    except (FileNotFoundError, RuntimeError, ValueError) as e:
+        sys.exit(str(e))
+    serve(entry.path, args.mtp, host=args.host, port=args.port)
