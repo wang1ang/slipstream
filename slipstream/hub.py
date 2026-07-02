@@ -16,6 +16,7 @@ queues. An HTTP thread submits a request and drains its text queue for SSE.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 
@@ -47,43 +48,99 @@ class Hub:
         self._ready.wait()
 
     # --- API side (any HTTP thread) -----------------------------------------
-    def prompt_ids(self, messages, tools=None):
-        """Render messages to (ids, stable_len). ids is the full prompt fed to
-        the model (with the generation prompt); stable_len marks the boundary of
-        the real client content — the history the client resends verbatim next
-        turn — which is exactly the add_generation_prompt=False render. Only that
-        prefix is cached; the trailing guide is not (see Scheduler)."""
+    def stream_messages(self, messages, max_tokens, tools=None, add_generation_prompt=True):
+        """Yield decoded text deltas for one request.
+
+        L5 passes protocol-normalized messages here. L4 owns chat-template
+        rendering, tokenization, generation-prompt handling, and submission to
+        L3. L5 never sees prompt token ids.
+        """
+        if self._cfg["debug"]:
+            print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
+                  f"max_tokens={max_tokens!r} "
+                  f"add_generation_prompt={add_generation_prompt!r}",
+                  file=sys.stderr, flush=True)
+        prompt_ids, session_prompt_len = self._prompt_ids(
+            messages, tools, add_generation_prompt=add_generation_prompt
+        )
+        yield from self._stream_prompt_ids(prompt_ids, session_prompt_len, max_tokens)
+
+    def _prompt_ids(self, messages, tools=None, *, add_generation_prompt=True):
+        """Render messages to token ids for L3."""
         msgs = normalize_messages_for_template(messages)
         tok = self.eng.tokenizer
         kw = {"tools": tools} if tools else {}
-        stable = tok.apply_chat_template(msgs, add_generation_prompt=False, **kw)
-        full = tok.apply_chat_template(msgs, add_generation_prompt=True, **kw)
-        stable_len = len(stable)
-        # The guide must be a pure append; if a template rewrites earlier tokens
-        # instead, don't trust the boundary — cache the whole thing (today's
-        # behavior, still correct).
-        if list(full[:stable_len]) != list(stable):
-            stable_len = len(full)
-        return full, stable_len
+        prompt_ids = tok.apply_chat_template(
+            msgs, add_generation_prompt=add_generation_prompt, **kw
+        )
+        if not add_generation_prompt:
+            return prompt_ids, len(prompt_ids)
+        session_prompt_len = self._session_prompt_len(msgs, kw)
+        return prompt_ids, session_prompt_len if session_prompt_len is not None \
+            else len(prompt_ids)
 
-    def stream_text(self, prompt_ids, max_tokens, stable_len=None):
+    def _session_prompt_len(self, msgs, kw) -> int | None:
+        text = self._assistant_content_start(msgs, kw)
+        if text is None:
+            return None
+        return len(self._encode_template_text(self.eng.tokenizer, text))
+
+    def _assistant_content_start(self, msgs, kw) -> str | None:
+        sentinel = "SLIPSTREAMRESPONSESENTINEL"
+        try:
+            with_content = self.eng.tokenizer.apply_chat_template(
+                msgs + [
+                    {"role": "assistant", "content": sentinel},
+                    {"role": "user", "content": "SLIPSTREAMDUMMYUSER"},
+                ],
+                add_generation_prompt=False, tokenize=False, **kw
+            )
+        except Exception:
+            return None
+
+        marker = with_content.find(sentinel)
+        return None if marker < 0 else with_content[:marker]
+
+    @staticmethod
+    def _encode_template_text(tok, text: str) -> list[int]:
+        try:
+            return tok.encode(text, add_special_tokens=False)
+        except TypeError:
+            return tok.encode(text)
+
+    def _stream_prompt_ids(self, prompt_ids, session_prompt_len, max_tokens):
         """Yield decoded text deltas for one request until it finishes. If the
         consumer stops early (client disconnects -> the SSE handler stops
         iterating -> this generator is closed), mark the request cancelled so the
         engine thread drops it instead of finishing generation for no one."""
         q: queue.Queue = queue.Queue()
         with self._lock:
-            r = Req(self._rid, list(prompt_ids), max_tokens, stable_len=stable_len)
+            r = Req(self._rid, list(prompt_ids), max_tokens,
+                    session_prompt_len=session_prompt_len, session_cache=True)
             self._rid += 1
             self._incoming.append(r)
             self._queues[r.rid] = q
             self._toks[r.rid] = []
             self._shown[r.rid] = 0
+            if self._cfg["debug"]:
+                try:
+                    prompt_text = self.eng.tokenizer.decode(
+                        list(prompt_ids), skip_special_tokens=False
+                    )
+                except TypeError:
+                    prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
+                print(f"[hub] L4 OUT L3 rid={r.rid} prompt_len={len(prompt_ids)} "
+                      f"session_prompt_len={session_prompt_len}\n"
+                      f"{prompt_text}",
+                      file=sys.stderr, flush=True)
         try:
             while True:
                 item = q.get()
                 if item is _DONE:
                     return
+                if self._cfg["debug"]:
+                    print(f"[hub] L4 OUT L5 rid={r.rid} delta={item!r}",
+                          file=sys.stderr, flush=True)
                 yield item
         finally:
             # Normal completion already cleaned up; this matters on early close.

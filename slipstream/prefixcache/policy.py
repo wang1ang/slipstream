@@ -70,7 +70,9 @@ class PrefixCache:
         return Match(prefix_len=len(best.prefix), payload=best.payload)
 
     def store(self, prefix, payload) -> None:
-        """Add one boundary snapshot, evicting LRU past capacity."""
-        self._snaps.append(Snapshot(prefix=tuple(prefix), payload=payload))
+        """Add or replace one snapshot, evicting LRU past capacity."""
+        prefix = tuple(prefix)
+        self._snaps = [s for s in self._snaps if s.prefix != prefix]
+        self._snaps.append(Snapshot(prefix=prefix, payload=payload))
         while len(self._snaps) > self.capacity:
             self._snaps.pop(0)

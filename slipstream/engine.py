@@ -261,7 +261,14 @@ class Engine:
             if isinstance(c, ArraysCache):
                 c.cache = [None if v is None else v + 0 for v in layer_ssm]
             else:
-                c.state = [None if v is None else v + 0 for v in layer_full]
+                layer = [None if v is None else v + 0 for v in layer_full]
+                if isinstance(c, BatchKVCache) and len(layer) == 2:
+                    c.keys, c.values = layer
+                    c.offset = mx.array([c.keys.shape[2]])
+                    c.left_padding = mx.array([0])
+                    c._idx = c.keys.shape[2]
+                else:
+                    c.state = layer
                 if pos < full_len:
                     c.trim(full_len - pos)   # KV has a position axis -> truncate
         return BatchState(cache=cache, lengths=[pos])

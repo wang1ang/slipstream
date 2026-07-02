@@ -79,14 +79,14 @@ def _sse(data, event=None):
     return f"{head}data: {json.dumps(data)}\n\n"
 
 
-def _stream_visible(backend, prompt_ids, max_tokens, tools, stable_len=None):
+def _stream_visible(backend, messages, max_tokens, tools):
     """Yield (visible_text_chunk, tool_calls). Visible chunks come as generated,
     with tool-call markup filtered out by the bridge when tools are offered; the
     final yield has an empty chunk and the tool_calls parsed from the full text
     (the oMLX contract: filter markup live, parse tool calls at completion)."""
     filt = ToolCallStreamFilter() if tools else None
     full = ""
-    for text in backend.stream_text(prompt_ids, max_tokens, stable_len):
+    for text in backend.stream_messages(messages, max_tokens, tools):
         full += text
         visible = filt.feed(text) if filt else text
         if visible:
@@ -99,7 +99,7 @@ def _stream_visible(backend, prompt_ids, max_tokens, tools, stable_len=None):
         yield "", calls
 
 
-def _chat_stream(backend, prompt_ids, max_tokens, tools=None, stable_len=None):
+def _chat_stream(backend, messages, max_tokens, tools=None):
     rid, created = _hex("chatcmpl-"), int(time.time())
 
     def chunk(delta, finish=None):
@@ -111,7 +111,7 @@ def _chat_stream(backend, prompt_ids, max_tokens, tools=None, stable_len=None):
 
     yield chunk({"role": "assistant"})
     calls = []
-    for visible, tool_calls in _stream_visible(backend, prompt_ids, max_tokens, tools, stable_len):
+    for visible, tool_calls in _stream_visible(backend, messages, max_tokens, tools):
         if visible:
             yield chunk({"content": visible})
         if tool_calls:
@@ -126,7 +126,7 @@ def _chat_stream(backend, prompt_ids, max_tokens, tools=None, stable_len=None):
     yield "data: [DONE]\n\n"
 
 
-def _responses_stream(backend, prompt_ids, max_tokens, tools=None, stable_len=None):
+def _responses_stream(backend, messages, max_tokens, tools=None):
     rid, mid = _hex("resp_"), _hex("msg_")
     base = {"id": rid, "object": "response", "model": backend.model_id}
 
@@ -137,7 +137,7 @@ def _responses_stream(backend, prompt_ids, max_tokens, tools=None, stable_len=No
                  "status": "in_progress"}}, "response.output_item.added")
 
     full, calls = "", []
-    for visible, tool_calls in _stream_visible(backend, prompt_ids, max_tokens, tools, stable_len):
+    for visible, tool_calls in _stream_visible(backend, messages, max_tokens, tools):
         if visible:
             full += visible
             yield _sse({"type": "response.output_text.delta", "item_id": mid, "delta": visible},
@@ -243,20 +243,18 @@ def make_handler(backend: Hub):
             tools = body.get("tools")
             if path == "/v1/chat/completions":
                 msgs = _messages_from_chat(body)
-                ids, stable_len = backend.prompt_ids(msgs, tools)
                 if stream:
-                    self._sse_stream(_chat_stream(backend, ids, max_tokens, tools, stable_len))
+                    self._sse_stream(_chat_stream(backend, msgs, max_tokens, tools))
                 else:
-                    text = "".join(backend.stream_text(ids, max_tokens, stable_len))
+                    text = "".join(backend.stream_messages(msgs, max_tokens, tools))
                     clean, calls = _split_tool_calls(text, tools)
                     self._json(200, _chat_body(backend, clean, calls))
             elif path == "/v1/responses":
                 msgs = _messages_from_responses(body)
-                ids, stable_len = backend.prompt_ids(msgs, tools)
                 if stream:
-                    self._sse_stream(_responses_stream(backend, ids, max_tokens, tools, stable_len))
+                    self._sse_stream(_responses_stream(backend, msgs, max_tokens, tools))
                 else:
-                    text = "".join(backend.stream_text(ids, max_tokens, stable_len))
+                    text = "".join(backend.stream_messages(msgs, max_tokens, tools))
                     clean, calls = _split_tool_calls(text, tools)
                     self._json(200, _responses_body(backend, clean, calls))
             else:

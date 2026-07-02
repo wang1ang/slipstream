@@ -32,10 +32,13 @@ class Req:
     rid: int
     prompt: list[int]
     max_tokens: int
-    # tokens [:stable_len] are the real client content (resent verbatim next
-    # turn); anything after is L4's temporary generation guide. Only the stable
-    # part is cached. None -> the whole prompt is stable (direct callers/tests).
-    stable_len: int | None = None
+    # Boundary where assistant content starts in the prompt L4 sent. Session
+    # final-state cache stores prompt[:session_prompt_len] + generated tokens.
+    session_prompt_len: int | None = None
+    # L4 marks chat/session requests so L3 stores the final state after emitted
+    # generation. Direct callers/tests can leave this off and only use prompt
+    # block caching.
+    session_cache: bool = False
     out: list[int] = field(default_factory=list)
 
 
@@ -134,49 +137,58 @@ class Scheduler:
     def _prefill_one(self, group, i, cancelled):
         """Prefill one request, reusing a cached prefix when possible. On a hit,
         restore the snapshot and forward only the tail; otherwise cold-prefill.
-        Either way, cache the finished state's snapshot for the next turn. Fills
-        group.singles[i] / firsts[i] / last_h[i]; leaves singles[i] None if
-        cancelled mid-prefill."""
+        Cold prefill stores prompt block boundaries; session requests additionally
+        store their final generated state when they exit. Fills group.singles[i] /
+        firsts[i] / last_h[i]; leaves singles[i] None if cancelled mid-prefill."""
         req = group.reqs[i]
         ids = req.prompt
         eng = self.eng
-        # Cache only the stable part (real client content); the trailing L4
-        # generation guide differs every turn and must not enter the key.
-        sl = req.stable_len if req.stable_len is not None else len(ids)
-        match = self.pc.find(ids[:sl])
+        match = self.pc.find(ids)
 
         # Continue from a reused prefix (restore at the matched boundary), or
-        # cold-start from scratch — both then run the remaining tokens chunked,
-        # snapshotting SSM at the tail boundaries so THIS turn's deeper prefix is
-        # cached for the next turn (a hit must still refresh the cache, else the
-        # pool stays stuck at the first turn's shallow boundaries).
-        ssm_snaps: dict[int, list] = {}
+        # cold-start from scratch.
         stop = (lambda: cancelled and cancelled(req.rid))
+        cached_h = None
         if match is not None:
-            full, base_ssm, pos = match.payload
+            payload = match.payload
+            if len(payload) == 3:
+                full, base_ssm, pos = payload
+            else:
+                full, base_ssm, pos, cached_h = payload
             state = eng.restore_at(full, base_ssm, pos)
             self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
                       f"rid={req.rid}")
+            # Older prompt-block entries do not include the last hidden state.
+            # An exact hit with no tail cannot produce the first sampled token
+            # from KV/SSM alone, so rerun cold in that rare case.
+            if cached_h is None and pos == len(ids):
+                match = None
+                state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
+                pos = 0
+                self._log(f"PREFIX HIT exact without hidden; cold rerun rid={req.rid}")
         else:
             state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
             pos = 0
             self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
 
-        h = eng._run_chunked(state, ids[pos:], self.chunk, log=self._log, stop=stop,
-                             on_ssm=lambda p, s: ssm_snaps.__setitem__(p, s))
+        # Prompt cache is populated only for a fully cold prefill. It stores
+        # chunk-boundary blocks so future prompts can reuse a long prefix.
+        ssm_snaps: dict[int, list] = {}
+        on_ssm = (lambda p, s: ssm_snaps.__setitem__(p, s)) if match is None else None
+        h = cached_h if pos == len(ids) else eng._run_chunked(
+            state, ids[pos:], self.chunk, log=self._log, stop=stop, on_ssm=on_ssm
+        )
+        if h is not None and match is None:
+            full = eng.clone_state(state)
+            for p, ssm in ssm_snaps.items():
+                if p < len(ids):
+                    self.pc.store(ids[:p], (full, ssm, p))
+
         if h is None:                               # cancelled mid-prefill
             self._log(f"PREFILL CANCELLED rid={req.rid}")
             return
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
-        # Cache this turn's boundary snapshots, all sharing this full KV snapshot.
-        # Only boundaries within the stable region: those keys are token-exactly
-        # resent next turn, so they align; deeper boundaries (into L4's guide)
-        # would poison the key.
-        full = eng.clone_state(state)
-        for p, ssm in ssm_snaps.items():
-            if p <= sl:
-                self.pc.store(ids[:p], (full, ssm, p))
 
         req.out.append(first)
         group.singles[i] = eng.extract_row(state, 0)
@@ -264,10 +276,53 @@ class Scheduler:
         self.state, self.h, self.primary = state, h, primary
 
         if finished:
+            for i in finished:
+                self._store_finished_session(rows[i], state, h, i)
             self._log(f"EXIT {[rows[i].rid for i in finished]}")
             self._keep([i for i in range(B) if i not in finished])
 
         return emitted
+
+    def _store_finished_session(self, req: Req, state: BatchState, h, row: int) -> None:
+        """Store the session prefix: prompt up to assistant content plus output."""
+        if self.pc is None or not req.session_cache:
+            return
+
+        prompt_len = req.session_prompt_len if req.session_prompt_len is not None \
+            else len(req.prompt)
+        prefix = req.prompt[:prompt_len] + req.out
+        if not prefix:
+            return
+
+        if prompt_len != len(req.prompt):
+            single, hidden = self.eng.prefill([prefix], chunk=self.chunk)
+            h_final = hidden[:, -1:, :]
+            mx.eval(h_final)
+            self.pc.store(prefix, (self.eng.clone_state(single),
+                                  self.eng.clone_ssm(single.cache),
+                                  len(prefix), h_final + 0))
+            self._log(f"SESSION STORE len={len(prefix)} prompt_len={prompt_len} "
+                      f"rid={req.rid}")
+            return
+
+        covered = state.lengths[row] - len(req.prompt)
+        if covered < 0 or covered > len(req.out):
+            self._log(f"SESSION STORE SKIP rid={req.rid} covered={covered} "
+                      f"out={len(req.out)}")
+            return
+
+        single = self.eng.extract_row(state, row)
+        h_final = h[row:row + 1]
+        missing = req.out[covered:]
+        if missing:
+            h_final = self.eng.forward(single, mx.array([missing], dtype=mx.int32))[:, -1:, :]
+
+        h_final = h_final[:, -1:, :]
+        mx.eval(h_final)
+        self.pc.store(prefix, (self.eng.clone_state(single),
+                              self.eng.clone_ssm(single.cache),
+                              len(prefix), h_final + 0))
+        self._log(f"SESSION STORE len={len(prefix)} rid={req.rid}")
 
     def _keep(self, keep: list[int]) -> None:
         """Retain only the given row indices in the live batch, dropping the
