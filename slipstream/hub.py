@@ -55,11 +55,11 @@ class Hub:
         rendering, tokenization, generation-prompt handling, and submission to
         L3. L5 never sees prompt token ids.
         """
-        if self._cfg["debug"]:
-            print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
-                  f"max_tokens={max_tokens!r} "
-                  f"add_generation_prompt={add_generation_prompt!r}",
-                  file=sys.stderr, flush=True)
+        # if self._cfg["debug"]:
+        #     print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
+        #           f"max_tokens={max_tokens!r} "
+        #           f"add_generation_prompt={add_generation_prompt!r}",
+        #           file=sys.stderr, flush=True)
         prompt_ids, session_prompt_len = self._prompt_ids(
             messages, tools, add_generation_prompt=add_generation_prompt
         )
@@ -122,25 +122,22 @@ class Hub:
             self._queues[r.rid] = q
             self._toks[r.rid] = []
             self._shown[r.rid] = 0
-            if self._cfg["debug"]:
-                try:
-                    prompt_text = self.eng.tokenizer.decode(
-                        list(prompt_ids), skip_special_tokens=False
-                    )
-                except TypeError:
-                    prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
-                print(f"[hub] L4 OUT L3 rid={r.rid} prompt_len={len(prompt_ids)} "
-                      f"session_prompt_len={session_prompt_len}\n"
-                      f"{prompt_text}",
-                      file=sys.stderr, flush=True)
+            # if self._cfg["debug"]:
+            #     try:
+            #         prompt_text = self.eng.tokenizer.decode(
+            #             list(prompt_ids), skip_special_tokens=False
+            #         )
+            #     except TypeError:
+            #         prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
+            #     print(f"[hub] L4 OUT L3 rid={r.rid} prompt_len={len(prompt_ids)} "
+            #           f"session_prompt_len={session_prompt_len}\n"
+            #           f"{prompt_text}",
+            #           file=sys.stderr, flush=True)
         try:
             while True:
                 item = q.get()
                 if item is _DONE:
                     return
-                if self._cfg["debug"]:
-                    print(f"[hub] L4 OUT L5 rid={r.rid} delta={item!r}",
-                          file=sys.stderr, flush=True)
                 yield item
         finally:
             # Normal completion already cleaned up; this matters on early close.
