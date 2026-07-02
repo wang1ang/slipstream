@@ -19,6 +19,7 @@ import queue
 import threading
 import time
 
+from .bridge import normalize_messages_for_template
 from .engine import Engine
 from .mtp import Drafter
 from .scheduler import Scheduler, Req, PrefillGroup
@@ -47,16 +48,32 @@ class Hub:
 
     # --- API side (any HTTP thread) -----------------------------------------
     def prompt_ids(self, messages, tools=None):
-        return self.eng.apply_chat_template(messages, tools=tools)
+        """Render messages to (ids, stable_len). ids is the full prompt fed to
+        the model (with the generation prompt); stable_len marks the boundary of
+        the real client content — the history the client resends verbatim next
+        turn — which is exactly the add_generation_prompt=False render. Only that
+        prefix is cached; the trailing guide is not (see Scheduler)."""
+        msgs = normalize_messages_for_template(messages)
+        tok = self.eng.tokenizer
+        kw = {"tools": tools} if tools else {}
+        stable = tok.apply_chat_template(msgs, add_generation_prompt=False, **kw)
+        full = tok.apply_chat_template(msgs, add_generation_prompt=True, **kw)
+        stable_len = len(stable)
+        # The guide must be a pure append; if a template rewrites earlier tokens
+        # instead, don't trust the boundary — cache the whole thing (today's
+        # behavior, still correct).
+        if list(full[:stable_len]) != list(stable):
+            stable_len = len(full)
+        return full, stable_len
 
-    def stream_text(self, prompt_ids, max_tokens):
+    def stream_text(self, prompt_ids, max_tokens, stable_len=None):
         """Yield decoded text deltas for one request until it finishes. If the
         consumer stops early (client disconnects -> the SSE handler stops
         iterating -> this generator is closed), mark the request cancelled so the
         engine thread drops it instead of finishing generation for no one."""
         q: queue.Queue = queue.Queue()
         with self._lock:
-            r = Req(self._rid, list(prompt_ids), max_tokens)
+            r = Req(self._rid, list(prompt_ids), max_tokens, stable_len=stable_len)
             self._rid += 1
             self._incoming.append(r)
             self._queues[r.rid] = q

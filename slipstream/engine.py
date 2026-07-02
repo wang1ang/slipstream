@@ -37,12 +37,7 @@ from mlx_lm import load
 from mlx_lm.generate import _make_cache, _right_pad_prompts
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
-from .bridge import normalize_messages_for_template
 
-
-# A "developer" message IS a system message in OpenAI's newer API — a semantic
-# rename, applied always (independent of any model). Any other role a template
-# rejects is left to raise: no silent downgrade (surface the problem).
 def find_mtp(model_path: str) -> str | None:
     """The MTP head sits beside the model as mtp.safetensors; return its path,
     or None if absent (the model then runs pure AR / headless)."""
@@ -86,16 +81,6 @@ class Engine:
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
-    def apply_chat_template(self, messages: list[dict], tools=None) -> list[int]:
-        """Render messages (and optional tools) to prompt token ids. Messages are
-        normalized for the template by the bridge layer (developer->system,
-        system consolidated to the front, tool results/calls preserved). When
-        tools are given, the template advertises them to the model natively."""
-        msgs = normalize_messages_for_template(messages)
-        kwargs = {"add_generation_prompt": True}
-        if tools:
-            kwargs["tools"] = tools
-        return self.tokenizer.apply_chat_template(msgs, **kwargs)
 
     def decode(self, token_ids: list[int]) -> str:
         # skip_special_tokens drops <|im_end|>/<|endoftext|> etc from the text.

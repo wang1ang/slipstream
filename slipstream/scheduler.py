@@ -32,6 +32,10 @@ class Req:
     rid: int
     prompt: list[int]
     max_tokens: int
+    # tokens [:stable_len] are the real client content (resent verbatim next
+    # turn); anything after is L4's temporary generation guide. Only the stable
+    # part is cached. None -> the whole prompt is stable (direct callers/tests).
+    stable_len: int | None = None
     out: list[int] = field(default_factory=list)
 
 
@@ -136,7 +140,10 @@ class Scheduler:
         req = group.reqs[i]
         ids = req.prompt
         eng = self.eng
-        match = self.pc.find(ids)
+        # Cache only the stable part (real client content); the trailing L4
+        # generation guide differs every turn and must not enter the key.
+        sl = req.stable_len if req.stable_len is not None else len(ids)
+        match = self.pc.find(ids[:sl])
 
         # Continue from a reused prefix (restore at the matched boundary), or
         # cold-start from scratch — both then run the remaining tokens chunked,
@@ -163,9 +170,13 @@ class Scheduler:
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
         # Cache this turn's boundary snapshots, all sharing this full KV snapshot.
+        # Only boundaries within the stable region: those keys are token-exactly
+        # resent next turn, so they align; deeper boundaries (into L4's guide)
+        # would poison the key.
         full = eng.clone_state(state)
         for p, ssm in ssm_snaps.items():
-            self.pc.store(ids[:p], (full, ssm, p))
+            if p <= sl:
+                self.pc.store(ids[:p], (full, ssm, p))
 
         req.out.append(first)
         group.singles[i] = eng.extract_row(state, 0)
