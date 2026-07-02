@@ -22,17 +22,11 @@ from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
 
-from slipstream.engine import Engine
+from slipstream.engine import Engine, find_mtp
 from slipstream.mtp import Drafter
 from slipstream.scheduler import Scheduler, Req, PrefillGroup
 
 MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
-
-
-def find_mtp(model_path):
-    """MTP head lives beside the model as mtp.safetensors; absent -> headless."""
-    p = os.path.join(model_path, "mtp.safetensors")
-    return p if os.path.exists(p) else None
 
 
 def to_ids(eng, text, raw):

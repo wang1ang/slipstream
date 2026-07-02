@@ -38,6 +38,13 @@ from mlx_lm.generate import _make_cache, _right_pad_prompts
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 
+def find_mtp(model_path: str) -> str | None:
+    """The MTP head sits beside the model as mtp.safetensors; return its path,
+    or None if absent (the model then runs pure AR / headless)."""
+    p = os.path.join(os.path.expanduser(model_path), "mtp.safetensors")
+    return p if os.path.exists(p) else None
+
+
 @dataclass
 class BatchState:
     """Batched cache + per-row bookkeeping for B aligned sequences."""

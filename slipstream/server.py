@@ -23,6 +23,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .engine import find_mtp
 from .hub import Hub
 
 
@@ -188,11 +189,11 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000, bits=4):
-    # mtp_path None -> derive <model>/mtp.safetensors; "" -> force headless.
+    # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
+    # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
-        mtp_path = os.path.join(model_path, "mtp.safetensors")
-    # Absent head file (derived or explicit) -> serve the plain model as pure AR.
-    if not mtp_path or not os.path.exists(mtp_path):
+        mtp_path = find_mtp(model_path)
+    elif not os.path.exists(mtp_path):
         mtp_path = None
     print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
     backend = Hub(model_path, mtp_path, bits=bits)
