@@ -399,8 +399,7 @@ if __name__ == "__main__":
                          "on by default, --no-debug to silence")
     ap.add_argument("--prefix-cache-dir", default="auto",
                     help="prefix cache load dir; default 'auto' reads "
-                         "~/.cache/multiplex/prefixcache/<model>. "
-                         "Disk writes are currently disabled.")
+                         "~/.cache/multiplex/prefixcache/<model>.")
     args = ap.parse_args()
 
     # registry.select behaves per-environment: a server run without a tty gets

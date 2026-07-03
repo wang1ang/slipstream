@@ -226,6 +226,8 @@ class Scheduler:
             block = end // self.chunk
             source = f"prompt rid={req.rid} block={block}"
             cached_h = h[:, -1:, :] if end == len(ids) else None
+            if cached_h is not None:
+                mx.eval(cached_h)
         stored = self.pc.store_block(
             ids, start, end, attn, ssm=ssm, source=source,
             pool="prompt", cached_h=cached_h,

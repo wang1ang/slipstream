@@ -1,9 +1,7 @@
-"""Low-level disk helpers for future PrefixCache persistence.
+"""Low-level disk helpers for PrefixCache persistence.
 
-This file intentionally does not define a cache manifest format. The current
-prefix cache is an in-memory block tree; when persistence is redesigned, these
-helpers can still provide tensor-tree encoding, content-addressed blobs, and
-atomic JSON writes.
+This module owns tensor-tree encoding, content-addressed blobs, atomic JSON
+records, and the bounded background writer used by the in-memory block tree.
 """
 
 from __future__ import annotations
@@ -144,7 +142,7 @@ def decode_tree(spec: Any, read_blob: Callable[[str], bytes]) -> Any:
 
 
 class BlobStore:
-    """Content-addressed blob store used by future cache manifests."""
+    """Content-addressed blob store used by prefix-cache records."""
 
     def __init__(self, base_dir: str | os.PathLike) -> None:
         self.base_dir = Path(base_dir).expanduser()
