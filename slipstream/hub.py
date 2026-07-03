@@ -73,6 +73,16 @@ class Hub:
         msgs = normalize_messages_for_template(messages)
         tok = self.eng.tokenizer
         kw = {"tools": tools} if tools else {}
+        if add_generation_prompt:
+            # Use the same assistant-content prefix that the next turn's
+            # history rendering will use. Some chat templates render
+            # add_generation_prompt slightly differently (notably around empty
+            # <think> scaffolding), which breaks session-prefix cache reuse.
+            text = self._assistant_content_start(msgs, kw)
+            if text is not None:
+                prompt_ids = self._encode_template_text(tok, text)
+                return prompt_ids, len(prompt_ids)
+
         prompt_ids = tok.apply_chat_template(
             msgs, add_generation_prompt=add_generation_prompt, **kw
         )
