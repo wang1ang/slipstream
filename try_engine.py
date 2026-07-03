@@ -17,7 +17,7 @@ import asyncio
 import mlx.core as mx
 from prompt_toolkit import Application
 from prompt_toolkit.buffer import Buffer
-from prompt_toolkit.layout import Layout, HSplit, Window
+from prompt_toolkit.layout import Layout, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
@@ -43,7 +43,8 @@ def main() -> int:
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
     ap.add_argument("-d", "--depth", type=int, default=1)
-    ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
+                    help="show scheduler debug log in the log pane")
     args = ap.parse_args()
 
     entry = registry.select(args.model)
@@ -51,33 +52,55 @@ def main() -> int:
     print(f"[loading {entry.name}{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
     eng = Engine(entry.path)
     drafter = Drafter(eng, mtp) if mtp else None
-    sch = Scheduler(eng, drafter, k=args.depth, chunk=512, debug=args.debug)
+
+    debug_lines = []
+
+    def append_debug(line):
+        debug_lines.append(line)
+        del debug_lines[:-80]
+
+    sch = Scheduler(
+        eng, drafter, k=args.depth, chunk=512, debug=args.debug,
+        log=append_debug if args.debug else None,
+    )
 
     prompts = {}         # rid -> prompt text
     produced_text = {}   # rid -> decoded output so far
-    output_lines = [""]
 
-    # output shown via a read-only Buffer: putting the cursor at the end makes
-    # the window auto-scroll to the bottom (follow latest output).
+    # Buffers are read-only panes; putting the cursor at the end makes each
+    # window auto-scroll to the bottom (follow latest output).
     output_buf = Buffer(read_only=True)
+    log_buf = Buffer(read_only=True)
 
     def render():
-        lines = ["[Type a prompt + Enter. Add more while it runs (入). :q quits.]", ""]
+        output_lines = [
+            "[Type a prompt + Enter. Add more while it runs (入). :q quits.]",
+            "",
+        ]
         for rid in sorted(produced_text):
-            lines.append(f"--- req{rid}: {prompts.get(rid, '')[:50]!r}")
-            lines.extend(produced_text[rid].split("\n"))
-            lines.append("")
-        text = "\n".join(lines)
+            output_lines.append(f"--- req{rid}: {prompts.get(rid, '')[:50]!r}")
+            output_lines.extend(produced_text[rid].split("\n"))
+            output_lines.append("")
+        text = "\n".join(output_lines)
         output_buf.set_document(
             Document(text, cursor_position=len(text)), bypass_readonly=True
         )
 
-    # --- UI: scrolling output on top, fixed input box at bottom ---
+        log_lines = ["[scheduler log]", ""]
+        log_lines.extend(debug_lines[-80:] if debug_lines else ["(no logs yet)"])
+        log_text = "\n".join(log_lines)
+        log_buf.set_document(
+            Document(log_text, cursor_position=len(log_text)), bypass_readonly=True
+        )
+
+    # --- UI: output and log on top, fixed input box at bottom ---
     output_win = Window(content=BufferControl(buffer=output_buf), wrap_lines=True)
+    log_win = Window(content=BufferControl(buffer=log_buf), wrap_lines=True)
+    top = VSplit([output_win, Window(width=1, char="│"), log_win])
     input_buf = Buffer(multiline=False)
     input_win = Window(content=BufferControl(buffer=input_buf), height=1)
     layout = Layout(
-        HSplit([output_win, Window(height=1, char="─"), input_win]),
+        HSplit([top, Window(height=1, char="─"), input_win]),
         focused_element=input_win,
     )
 
@@ -116,6 +139,8 @@ def main() -> int:
     @kb.add("c-c")
     def _(event):
         event.app.exit()
+
+    render()
 
     app = Application(layout=layout, key_bindings=kb, full_screen=True,
                       mouse_support=True, refresh_interval=0.1)

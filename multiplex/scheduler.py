@@ -65,7 +65,8 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512,
-                 prefix_cache=8, prefix_cache_dir=None, output_log_dir=None, debug=False):
+                 prefix_cache=8, prefix_cache_dir=None, output_log_dir=None,
+                 debug=False, log=None):
         self.eng = engine
         self.dr = drafter
         # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
@@ -73,6 +74,7 @@ class Scheduler:
         self.chunk = chunk
         self.eos = engine.eos_token_ids
         self.debug = debug
+        self.log = log
         self._t = 0
         self.output_log_dir = Path(output_log_dir) if output_log_dir else None
         # One prefix tree with two independent LRU pools. Prompt entries and
@@ -93,7 +95,11 @@ class Scheduler:
 
     def _log(self, msg):
         if self.debug:
-            print(f"[sched t={self._t}] {msg}", file=sys.stderr, flush=True)
+            line = f"[sched t={self._t}] {msg}"
+            if self.log is not None:
+                self.log(line)
+            else:
+                print(line, file=sys.stderr, flush=True)
 
     def _prefix_cache_dir(self, value):
         if value in (None, False, "", "none", "off"):
