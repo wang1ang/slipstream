@@ -69,12 +69,13 @@ class Scheduler:
         self.eos = engine.eos_token_ids
         self.debug = debug
         self._t = 0
-        # Two independent LRU pools: prompt cache stores cold prefill blocks;
-        # session cache stores generated-session blocks. They share lookup but
-        # never evict each other's entries.
+        # One prefix tree with two independent LRU pools. Prompt entries and
+        # session entries share prefix structure but never evict each other.
         cache_dir = self._prefix_cache_dir(prefix_cache_dir)
-        self.prompt_pc = self._cache_pool(prefix_cache, cache_dir, "prompt")
-        self.session_pc = self._cache_pool(prefix_cache, cache_dir, "session")
+        self.pc = PrefixCache(capacity={"prompt": prefix_cache,
+                                        "session": prefix_cache},
+                              disk_dir=cache_dir, log=self._log) \
+            if prefix_cache else None
 
         # live decode batch
         self.state: BatchState | None = None
@@ -97,33 +98,17 @@ class Scheduler:
         name = os.path.basename(model_path.rstrip(os.sep)) or "model"
         return Path.home() / ".cache" / "multiplex" / "prefixcache" / f"{name}-{digest}"
 
-    def _cache_pool(self, capacity, base_dir, name):
-        if not capacity:
-            return None
-        disk_dir = Path(base_dir) / name if base_dir else None
-        return PrefixCache(capacity=capacity, disk_dir=disk_dir, log=self._log)
-
     def _find_cache(self, ids):
-        best = None
-        for kind, cache in (("session", self.session_pc),
-                            ("prompt", self.prompt_pc)):
-            if cache is None:
-                continue
-            match = cache.find(ids)
-            if match is not None and (
-                best is None or match.prefix_len > best[1].prefix_len
-            ):
-                best = (kind, match)
-        return best
+        return self.pc.find(ids) if self.pc is not None else None
 
-    def _log_prefix_cache_decision(self, req: Req, ids, hit) -> None:
-        if not self.debug or (self.prompt_pc is None and self.session_pc is None):
+    def _log_prefix_cache_decision(self, req: Req, ids, match) -> None:
+        if not self.debug or self.pc is None:
             return
-        kind, match = hit if hit is not None else (None, None)
         chosen = match.prefix_len if match is not None else 0
         source = match.source if match is not None else None
         self._log(f"PREFIX CACHE FIND rid={req.rid} prompt_len={len(ids)} "
-                  f"chosen={chosen} pool={kind!r} source={source!r}")
+                  f"chosen={chosen} pool={getattr(match, 'pool', None)!r} "
+                  f"source={source!r}")
 
     def has_rows(self):
         return bool(self.rows)
@@ -185,7 +170,7 @@ class Scheduler:
             h = eng.prefill_piece(group.state, ids[start:end], len(ids),
                                   log=self._log)
             group.pos = end
-            if (group.cacheable and self.prompt_pc is not None and self.chunk
+            if (group.cacheable and self.pc is not None and self.chunk
                     and end < len(ids) and end >= len(ids) - 3 * self.chunk
                     and end - start == self.chunk
                     and end >= PROMPT_CACHE_MIN_TOKENS):
@@ -196,15 +181,16 @@ class Scheduler:
             if group.pos < len(ids):
                 return False
 
-        if group.cacheable and self.prompt_pc is not None:
+        if group.cacheable and self.pc is not None:
             full = eng.clone_state(group.state)
             stored = False
             for p, ssm in group.ssm_snaps.items():
                 if PROMPT_CACHE_MIN_TOKENS <= p < len(ids):
                     block = p // self.chunk if self.chunk else 0
-                    self.prompt_pc.store(
+                    self.pc.store(
                         ids, (full, ssm, p),
                         source=f"prompt rid={req.rid} block={block}",
+                        pool="prompt",
                         save=False,
                     )
                     stored = True
@@ -314,7 +300,7 @@ class Scheduler:
         return emitted
 
     def _capture_session_blocks(self, rows: list[Req], state: BatchState) -> None:
-        if self.session_pc is None or not self.chunk:
+        if self.pc is None or not self.chunk:
             return
         for i, req in enumerate(rows):
             if not req.session_cache:
@@ -330,7 +316,7 @@ class Scheduler:
 
     def _store_finished_session(self, req: Req, state: BatchState, row: int) -> None:
         """Store generated-session cache at block boundaries only."""
-        if self.session_pc is None or not req.session_cache:
+        if self.pc is None or not req.session_cache:
             return
 
         prefix = req.prompt + req.out
@@ -371,18 +357,17 @@ class Scheduler:
         full = self.eng.clone_state(single)
         for p, ssm in blocks:
             block = p // self.chunk if self.chunk else 0
-            self.session_pc.store(
+            self.pc.store(
                 prefix, (full, ssm, p),
                 source=f"session rid={req.rid} block={block}",
+                pool="session",
                 save=False,
             )
         self._log(f"SESSION STORE blocks={len(blocks)} len={len(prefix)} rid={req.rid}")
 
     def flush_prefix_cache(self) -> None:
-        if self.prompt_pc is not None:
-            self.prompt_pc.flush()
-        if self.session_pc is not None:
-            self.session_pc.flush()
+        if self.pc is not None:
+            self.pc.flush()
 
     def _keep(self, keep: list[int]) -> None:
         """Retain only the given row indices in the live batch, dropping the

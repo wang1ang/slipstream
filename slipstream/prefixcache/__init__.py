@@ -7,8 +7,9 @@ of the model state taken at chunk boundaries during prefill; a new request reuse
 the longest matching snapshot and only prefills the tail.
 
 Split in two:
-  * ``policy`` — pure logic (no MLX): longest-prefix matching over stored entries
-    and LRU eviction. This is what could become a standalone library.
+  * ``policy`` — pure logic (no MLX): trie longest-prefix matching over stored
+    entries and per-pool LRU eviction. This is what could become a standalone
+    library.
   * the state clone/restore lives in the engine (L1); L3 wires them together.
 
 The state object it stores is opaque here — the caller (L3) provides already

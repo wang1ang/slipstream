@@ -166,10 +166,12 @@ class PrefixCacheDiskStore:
                 nodes = []
                 for node_rec in rec.get("nodes", []):
                     cached_h_spec = node_rec.get("cached_h")
+                    source = node_rec.get("source")
                     node = node_cls(
                         pos=int(node_rec["pos"]),
                         ssm=decode_tree(node_rec["ssm"], self._read_blob),
-                        source=node_rec.get("source"),
+                        source=source,
+                        pool=node_rec.get("pool") or _pool_from_source(source),
                         cached_h=None if cached_h_spec is None else
                         decode_tree(cached_h_spec, self._read_blob),
                         touch=int(node_rec.get("touch", 0) or 0),
@@ -255,6 +257,7 @@ class PrefixCacheDiskStore:
                 {
                     "pos": int(node.pos),
                     "source": node.source,
+                    "pool": getattr(node, "pool", "default"),
                     "touch": int(node.touch),
                     "ssm": node.ssm_spec,
                     "cached_h": node.cached_h_spec,
@@ -339,3 +342,11 @@ def _prefix_digest(prefix: tuple[int, ...]) -> str:
     for token in prefix:
         h.update(int(token).to_bytes(8, byteorder="little", signed=True))
     return h.hexdigest()
+
+
+def _pool_from_source(source: str | None) -> str:
+    if source and source.startswith("session "):
+        return "session"
+    if source and source.startswith("prompt "):
+        return "prompt"
+    return "default"
