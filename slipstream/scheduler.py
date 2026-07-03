@@ -20,7 +20,6 @@ import os
 from pathlib import Path
 import sys
 from dataclasses import dataclass, field
-from typing import Any
 
 import mlx.core as mx
 
@@ -34,16 +33,11 @@ class Req:
     rid: int
     prompt: list[int]
     max_tokens: int
-    # Boundary where assistant content starts in the prompt L4 sent. Session
-    # final-state cache stores prompt[:session_prompt_len] + generated tokens.
-    session_prompt_len: int | None = None
-    # L4 marks chat/session requests so L3 stores the final state after emitted
-    # generation. Direct callers/tests can leave this off and only use prompt
-    # block caching.
+    # L4 marks chat/session requests so L3 can store generated block snapshots.
+    # Direct callers/tests can leave this off and only use prompt block caching.
     session_cache: bool = False
     out: list[int] = field(default_factory=list)
-    session_base_full: Any | None = None
-    session_base_ssm: Any | None = None
+    session_ssm_snaps: dict[int, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -133,7 +127,7 @@ class Scheduler:
             self._log_prefix_cache_decision(req, ids, match)
 
             group.cached_h = None
-            group.cacheable = match is None
+            group.cacheable = True
             if match is not None:
                 payload = match.payload
                 if len(payload) == 3:
@@ -154,7 +148,6 @@ class Scheduler:
                 group.pos = 0
                 self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
             group.started = True
-            self._capture_session_base(req, group.state)
 
         if cancelled and cancelled(req.rid):
             self._log(f"PREFILL CANCELLED rid={req.rid}")
@@ -164,13 +157,9 @@ class Scheduler:
         if h is None:
             start = group.pos
             end = min(start + self.chunk, len(ids)) if self.chunk else len(ids)
-            prompt_len = req.session_prompt_len
-            if prompt_len is not None and start < prompt_len < end:
-                end = prompt_len
             h = eng.prefill_piece(group.state, ids[start:end], len(ids),
                                   log=self._log)
             group.pos = end
-            self._capture_session_base(req, group.state)
             if (group.cacheable and self.pc is not None and self.chunk
                     and end < len(ids) and end >= len(ids) - 3 * self.chunk
                     and end - start == self.chunk):
@@ -204,15 +193,6 @@ class Scheduler:
         group.first = first
         group.last_h = h
         return True
-
-    def _capture_session_base(self, req: Req, state: BatchState) -> None:
-        prompt_len = req.session_prompt_len
-        if (not req.session_cache or prompt_len is None
-                or req.session_base_full is not None
-                or state.lengths[0] != prompt_len):
-            return
-        req.session_base_full = self.eng.clone_state(state)
-        req.session_base_ssm = self.eng.clone_ssm(state.cache)
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge one prefilled request into the live batch."""
@@ -295,47 +275,38 @@ class Scheduler:
             commit_in = mx.array([[int(verify_in[i, 0])] + draft_ids[i][:m] for i in range(B)])
             h = eng.forward(state, commit_in)[:, -1:, :]
         self.state, self.h, self.primary = state, h, primary
+        self._capture_session_blocks(rows, state)
 
         if finished:
             for i in finished:
-                self._store_finished_session(rows[i], state, h, i)
+                self._store_finished_session(rows[i], state, i)
             self._log(f"EXIT {[rows[i].rid for i in finished]}")
             self._keep([i for i in range(B) if i not in finished])
 
         return emitted
 
-    def _store_finished_session(self, req: Req, state: BatchState, h, row: int) -> None:
-        """Store the session prefix: prompt up to assistant content plus output."""
+    def _capture_session_blocks(self, rows: list[Req], state: BatchState) -> None:
+        if self.pc is None or not self.chunk:
+            return
+        for i, req in enumerate(rows):
+            if not req.session_cache:
+                continue
+            pos = state.lengths[i]
+            full_len = len(req.prompt) + len(req.out)
+            if pos <= len(req.prompt) or pos > full_len or pos % self.chunk:
+                continue
+            if pos in req.session_ssm_snaps:
+                continue
+            single = self.eng.extract_row(state, i)
+            req.session_ssm_snaps[pos] = self.eng.clone_ssm(single.cache)
+
+    def _store_finished_session(self, req: Req, state: BatchState, row: int) -> None:
+        """Store generated-session cache at block boundaries only."""
         if self.pc is None or not req.session_cache:
             return
 
-        prompt_len = req.session_prompt_len if req.session_prompt_len is not None \
-            else len(req.prompt)
-        prefix = req.prompt[:prompt_len] + req.out
+        prefix = req.prompt + req.out
         if not prefix:
-            return
-
-        if prompt_len != len(req.prompt):
-            if req.session_base_full is None or req.session_base_ssm is None:
-                self._log(f"SESSION STORE SKIP rid={req.rid} prompt_len={prompt_len} "
-                          f"prompt={len(req.prompt)} out={len(req.out)} "
-                          f"reason=no_session_base")
-                return
-            if not req.out:
-                self._log(f"SESSION STORE SKIP rid={req.rid} reason=no_output")
-                return
-            single = self.eng.restore_at(req.session_base_full,
-                                         req.session_base_ssm, prompt_len)
-            h_final = self.eng.forward(
-                single, mx.array([req.out], dtype=mx.int32)
-            )[:, -1:, :]
-            mx.eval(h_final)
-            self.pc.store(prefix, (self.eng.clone_state(single),
-                                  self.eng.clone_ssm(single.cache),
-                                  len(prefix), h_final + 0),
-                          source=f"session rid={req.rid}", save=False)
-            self._log(f"SESSION STORE len={len(prefix)} prompt_len={prompt_len} "
-                      f"rid={req.rid} replay={len(req.out)}")
             return
 
         covered = state.lengths[row] - len(req.prompt)
@@ -345,18 +316,37 @@ class Scheduler:
             return
 
         single = self.eng.extract_row(state, row)
-        h_final = h[row:row + 1]
-        missing = req.out[covered:]
-        if missing:
-            h_final = self.eng.forward(single, mx.array([missing], dtype=mx.int32))[:, -1:, :]
+        pos = single.lengths[0]
+        final_len = len(prefix)
+        while self.chunk and pos < final_len:
+            boundary = ((pos // self.chunk) + 1) * self.chunk
+            if boundary > final_len:
+                break
+            h_piece = self.eng.forward(
+                single, mx.array([prefix[pos:boundary]], dtype=mx.int32)
+            )
+            mx.eval(h_piece, *(c.state for c in single.cache))
+            pos = boundary
+            req.session_ssm_snaps[pos] = self.eng.clone_ssm(single.cache)
 
-        h_final = h_final[:, -1:, :]
-        mx.eval(h_final)
-        self.pc.store(prefix, (self.eng.clone_state(single),
-                              self.eng.clone_ssm(single.cache),
-                              len(prefix), h_final + 0),
-                      source=f"session rid={req.rid}", save=False)
-        self._log(f"SESSION STORE len={len(prefix)} rid={req.rid}")
+        if pos < final_len:
+            h_final = self.eng.forward(
+                single, mx.array([prefix[pos:final_len]], dtype=mx.int32)
+            )
+            mx.eval(h_final, *(c.state for c in single.cache))
+
+        blocks = [(p, ssm) for p, ssm in sorted(req.session_ssm_snaps.items())
+                  if len(req.prompt) < p <= final_len]
+        if not blocks:
+            return
+
+        full = self.eng.clone_state(single)
+        for p, ssm in blocks:
+            block = p // self.chunk if self.chunk else 0
+            self.pc.store(prefix, (full, ssm, p),
+                          source=f"session rid={req.rid} block={block}",
+                          save=False)
+        self._log(f"SESSION STORE blocks={len(blocks)} len={len(prefix)} rid={req.rid}")
 
     def flush_prefix_cache(self) -> None:
         if self.pc is not None:

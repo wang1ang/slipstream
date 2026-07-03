@@ -63,10 +63,10 @@ class Hub:
         #           f"max_tokens={max_tokens!r} "
         #           f"add_generation_prompt={add_generation_prompt!r}",
         #           file=sys.stderr, flush=True)
-        prompt_ids, session_prompt_len = self._prompt_ids(
+        prompt_ids = self._prompt_ids(
             messages, tools, add_generation_prompt=add_generation_prompt
         )
-        yield from self._stream_prompt_ids(prompt_ids, session_prompt_len, max_tokens)
+        yield from self._stream_prompt_ids(prompt_ids, max_tokens)
 
     def _prompt_ids(self, messages, tools=None, *, add_generation_prompt=True):
         """Render messages to token ids for L3."""
@@ -76,50 +76,16 @@ class Hub:
         prompt_ids = tok.apply_chat_template(
             msgs, add_generation_prompt=add_generation_prompt, **kw
         )
-        if not add_generation_prompt:
-            return prompt_ids, len(prompt_ids)
-        session_prompt_len = self._session_prompt_len(msgs, kw)
-        return prompt_ids, session_prompt_len if session_prompt_len is not None \
-            else len(prompt_ids)
+        return prompt_ids
 
-    def _session_prompt_len(self, msgs, kw) -> int | None:
-        text = self._assistant_content_start(msgs, kw)
-        if text is None:
-            return None
-        return len(self._encode_template_text(self.eng.tokenizer, text))
-
-    def _assistant_content_start(self, msgs, kw) -> str | None:
-        sentinel = "SLIPSTREAMRESPONSESENTINEL"
-        try:
-            with_content = self.eng.tokenizer.apply_chat_template(
-                msgs + [
-                    {"role": "assistant", "content": sentinel},
-                    {"role": "user", "content": "SLIPSTREAMDUMMYUSER"},
-                ],
-                add_generation_prompt=False, tokenize=False, **kw
-            )
-        except Exception:
-            return None
-
-        marker = with_content.find(sentinel)
-        return None if marker < 0 else with_content[:marker]
-
-    @staticmethod
-    def _encode_template_text(tok, text: str) -> list[int]:
-        try:
-            return tok.encode(text, add_special_tokens=False)
-        except TypeError:
-            return tok.encode(text)
-
-    def _stream_prompt_ids(self, prompt_ids, session_prompt_len, max_tokens):
+    def _stream_prompt_ids(self, prompt_ids, max_tokens):
         """Yield decoded text deltas for one request until it finishes. If the
         consumer stops early (client disconnects -> the SSE handler stops
         iterating -> this generator is closed), mark the request cancelled so the
         engine thread drops it instead of finishing generation for no one."""
         q: queue.Queue = queue.Queue()
         with self._lock:
-            r = Req(self._rid, list(prompt_ids), max_tokens,
-                    session_prompt_len=session_prompt_len, session_cache=True)
+            r = Req(self._rid, list(prompt_ids), max_tokens, session_cache=True)
             self._rid += 1
             self._incoming.append(r)
             self._queues[r.rid] = q
