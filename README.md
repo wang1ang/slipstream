@@ -1,10 +1,10 @@
-# slipstream
+# multiplex
 
 本地 LLM 推理框架,核心是 [mlx-lm](https://github.com/ml-explore/mlx-lm)。
 
 目标:**在保住 MTP 投机解码加速的同时,做真批量同时解码 + 序列随进随出** —— 这三者的组合现有引擎(mlx-lm / MTPLX / oMLX / llama.cpp)都没打通:它们一旦 batch_size>1 就关掉 MTP。
 
-> 名字待定,当前包名 `slipstream` 是临时的。
+> 项目名: `multiplex`。当前 Python import 包名仍是 `slipstream`。
 
 ## 设计原则
 

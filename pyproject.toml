@@ -1,5 +1,5 @@
 [project]
-name = "mini-mlx"
+name = "multiplex"
 version = "0.0.0"
 description = "Local LLM inference on mlx-lm: batched MTP speculative decoding with a dynamic-batch scheduler (concurrent requests join/leave mid-flight)."
 requires-python = ">=3.10"
