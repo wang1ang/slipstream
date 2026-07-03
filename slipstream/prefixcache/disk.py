@@ -175,9 +175,6 @@ class BlobStore:
     def read_blob(self, digest: str) -> bytes:
         return self._blob_path(digest).read_bytes()
 
-    def write_json_atomic(self, path: str | os.PathLike, data: Any) -> None:
-        write_json_atomic(Path(path), data)
-
     def _blob_path(self, digest: str) -> Path:
         return self.base_dir / "blobs" / digest[:2] / f"{digest}.bin"
 
@@ -214,7 +211,6 @@ class DiskBlockRecord:
     attn_spec: Any
     ssm_spec: Any | None = None
     cached_h_spec: Any | None = None
-    created_at: float = 0.0
 
     @classmethod
     def from_json(cls, data: dict[str, Any]) -> "DiskBlockRecord":
@@ -232,7 +228,6 @@ class DiskBlockRecord:
             attn_spec=data.get("attn"),
             ssm_spec=data.get("ssm"),
             cached_h_spec=data.get("cached_h"),
-            created_at=float(data.get("created_at", 0.0) or 0.0),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -249,7 +244,6 @@ class DiskBlockRecord:
             "attn": self.attn_spec,
             "ssm": self.ssm_spec,
             "cached_h": self.cached_h_spec,
-            "created_at": self.created_at,
         }
 
 
@@ -266,7 +260,6 @@ class AsyncPrefixDiskStore:
         self,
         base_dir: str | os.PathLike,
         *,
-        namespace: str = "",
         block_size: int = 256,
         max_bytes: int = 10 * 1024**3,
         queue_depth: int = 64,
@@ -275,7 +268,6 @@ class AsyncPrefixDiskStore:
         log: Callable[[str], None] | None = None,
     ) -> None:
         self.base_dir = Path(base_dir).expanduser()
-        self.namespace = str(namespace)
         self.block_size = max(1, int(block_size))
         self.max_bytes = int(max_bytes)
         self.cleanup_every = max(1, int(cleanup_every))
@@ -309,17 +301,14 @@ class AsyncPrefixDiskStore:
         )
         self._thread.start()
 
-    @staticmethod
     def make_block_key(
+        self,
         tokens: tuple[int, ...] | list[int],
         *,
         parent: str | None = None,
-        namespace: str = "",
     ) -> str:
         h = hashlib.sha256()
         h.update(b"slipstream-prefix-block-v1\0")
-        h.update(str(namespace).encode("utf-8"))
-        h.update(b"\0")
         h.update((parent or "").encode("ascii"))
         h.update(b"\0")
         for token in tokens:
@@ -439,7 +428,7 @@ class AsyncPrefixDiskStore:
         target = int(self.max_bytes * 0.9)
         by_key = {record.key: record for record in records}
         keep: set[str] = set()
-        for record in sorted(records, key=lambda r: (r.touch, r.created_at), reverse=True):
+        for record in sorted(records, key=lambda r: r.touch, reverse=True):
             chain = self._ancestor_chain(record, by_key)
             if not chain:
                 continue
@@ -517,7 +506,6 @@ class AsyncPrefixDiskStore:
             attn_spec=attn_spec,
             ssm_spec=ssm_spec,
             cached_h_spec=cached_h_spec,
-            created_at=time.time(),
         )
         write_json_atomic(self._record_path(task.key), record.to_json())
         with self._lock:
