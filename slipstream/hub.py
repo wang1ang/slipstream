@@ -36,7 +36,7 @@ class RequestManager:
     work, emits text, and finishes requests. Lower layers never see this object.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, output_log_dir: Path | None = None) -> None:
         self._lock = threading.Lock()
         self._incoming: list[Req] = []
         self._queues: dict[int, queue.Queue] = {}
@@ -44,6 +44,7 @@ class RequestManager:
         self._shown: dict[int, int] = {}
         self._cancelled: set[int] = set()
         self._rid = 0
+        self._output_log_dir = output_log_dir
 
     def submit(self, prompt_ids, max_tokens) -> tuple[Req, queue.Queue]:
         q: queue.Queue = queue.Queue()
@@ -54,6 +55,7 @@ class RequestManager:
             self._queues[req.rid] = q
             self._toks[req.rid] = []
             self._shown[req.rid] = 0
+        self._reset_output_log(req.rid)
         return req, q
 
     def cancel(self, rid: int) -> None:
@@ -97,9 +99,37 @@ class RequestManager:
             text = decode(all_toks)
             if q is None or len(text) <= shown:
                 continue
-            q.put(text[shown:])
+            delta = text[shown:]
+            self._append_output_log(rid, delta)
+            q.put(delta)
             with self._lock:
-                self._shown[rid] = len(text)
+                if rid in self._shown:
+                    self._shown[rid] = len(text)
+
+    def _output_log_path(self, rid: int) -> Path | None:
+        if self._output_log_dir is None:
+            return None
+        return self._output_log_dir / f"req-{rid}.output.log"
+
+    def _reset_output_log(self, rid: int) -> None:
+        path = self._output_log_path(rid)
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+
+    def _append_output_log(self, rid: int, text: str) -> None:
+        path = self._output_log_path(rid)
+        if path is None or not text:
+            return
+        try:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            pass
 
 
 class Hub:
@@ -109,8 +139,9 @@ class Hub:
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
                          prefix_cache_dir=prefix_cache_dir)
-        self._requests = RequestManager()
         self._request_log_dir = Path("logs") / "requests"
+        output_log_dir = self._request_log_dir if debug else None
+        self._requests = RequestManager(output_log_dir)
         # The model must be loaded AND used on the same thread (MLX's GPU stream
         # is thread-bound), so the engine thread loads it. Wait until ready.
         self._ready = threading.Event()

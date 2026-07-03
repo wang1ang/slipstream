@@ -19,6 +19,7 @@ import hashlib
 import os
 from pathlib import Path
 import sys
+import time
 from dataclasses import dataclass, field
 
 import mlx.core as mx
@@ -244,6 +245,7 @@ class Scheduler:
         eng, dr, k, eos = self.eng, self.dr, self.k, self.eos
         state, h, primary, rows = self.state, self.h, self.primary, self.rows
         B = len(rows)
+        t0 = time.perf_counter()
 
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
@@ -267,7 +269,6 @@ class Scheduler:
                     break
             accs.append(a)
         m = min(accs)
-        self._log(f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m}")
 
         emitted, finished = [], []
         for i in range(B):
@@ -289,6 +290,11 @@ class Scheduler:
             state.lengths = list(lengths_before)
             commit_in = mx.array([[int(verify_in[i, 0])] + draft_ids[i][:m] for i in range(B)])
             h = eng.forward(state, commit_in)[:, -1:, :]
+        mx.eval(h, primary)
+        dt = max(time.perf_counter() - t0, 1e-9)
+        tok_s = sum(len(toks) for _rid, toks in emitted) / dt
+        self._log(f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m} "
+                  f"{tok_s:.0f} tok/s")
         self.state, self.h, self.primary = state, h, primary
         self._capture_session_blocks(rows, state)
 
