@@ -291,10 +291,8 @@ class Scheduler:
         try:
             self.output_log_dir.mkdir(parents=True, exist_ok=True)
             text_path = self.output_log_dir / f"req-{req.rid}.output.log"
-            tok_path = self.output_log_dir / f"req-{req.rid}.output.tokens.log"
             if not req.output_log_started:
                 text_path.write_text("", encoding="utf-8")
-                tok_path.write_text("", encoding="utf-8")
                 req.output_log_started = True
 
             raw = self.eng.tokenizer.decode(req.out, skip_special_tokens=False)
@@ -303,9 +301,6 @@ class Scheduler:
                 with text_path.open("a", encoding="utf-8") as f:
                     f.write(delta)
                 req.output_log_chars = len(raw)
-            if toks:
-                with tok_path.open("a", encoding="utf-8") as f:
-                    f.write(" ".join(str(int(t)) for t in toks) + "\n")
         except Exception:
             pass
 
