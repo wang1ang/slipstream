@@ -16,11 +16,12 @@ queues. An HTTP thread submits a request and drains its text queue for SSE.
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import queue
 import threading
 import time
 
-from .bridge import normalize_messages_for_template
+from .bridge import ThinkingParser, normalize_messages_for_template
 from .engine import Engine
 from .mtp import Drafter
 from .scheduler import Scheduler, Req, PrefillGroup
@@ -111,6 +112,7 @@ class Hub:
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
                          prefix_cache_dir=prefix_cache_dir)
+        self._default_enable_thinking = self._load_default_enable_thinking(model_path)
         self._request_log_dir = Path("logs") / "requests"
         self._requests = RequestManager()
         # The model must be loaded AND used on the same thread (MLX's GPU stream
@@ -120,32 +122,105 @@ class Hub:
         self._ready.wait()
 
     # --- API side (any HTTP thread) -----------------------------------------
-    def stream_messages(self, messages, max_tokens, tools=None, add_generation_prompt=True):
+    def stream_messages(self, messages, max_tokens, tools=None,
+                        add_generation_prompt=True, enable_thinking=None):
         """Yield decoded text deltas for one request.
 
         L5 passes protocol-normalized messages here. L4 owns chat-template
         rendering, tokenization, generation-prompt handling, and submission to
         L3. L5 never sees prompt token ids.
         """
+        for field, text in self.stream_message_parts(
+            messages,
+            max_tokens,
+            tools=tools,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        ):
+            if field == "content":
+                yield text
+
+    def stream_message_parts(self, messages, max_tokens, tools=None,
+                             add_generation_prompt=True, enable_thinking=None):
+        """Yield L4-normalized assistant deltas as ``(field, text)``.
+
+        L3 only streams backend-native decoded text. L4 is the first layer that
+        knows both the rendered prompt and the client-facing protocol shape, so
+        it owns the Qwen-style ``<think>`` split before L5 formats SSE/JSON.
+        """
         # if self._cfg["debug"]:
         #     print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
         #           f"max_tokens={max_tokens!r} "
         #           f"add_generation_prompt={add_generation_prompt!r}",
         #           file=sys.stderr, flush=True)
+        effective_enable_thinking = self._effective_enable_thinking(enable_thinking)
         prompt_ids = self._prompt_ids(
-            messages, tools, add_generation_prompt=add_generation_prompt
+            messages,
+            tools,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=effective_enable_thinking,
         )
-        yield from self._stream_prompt_ids(prompt_ids, max_tokens)
+        thinking = ThinkingParser(
+            starts_in_thinking=self._prompt_opens_thinking(prompt_ids)
+        )
+        for raw_delta in self._stream_prompt_ids(prompt_ids, max_tokens):
+            reasoning_delta, content_delta = thinking.feed(raw_delta)
+            if reasoning_delta:
+                yield "reasoning_content", reasoning_delta
+            if content_delta:
+                yield "content", content_delta
+        reasoning_delta, content_delta = thinking.finish()
+        if reasoning_delta:
+            yield "reasoning_content", reasoning_delta
+        if content_delta:
+            yield "content", content_delta
 
-    def _prompt_ids(self, messages, tools=None, *, add_generation_prompt=True):
+    def _prompt_ids(self, messages, tools=None, *, add_generation_prompt=True,
+                    enable_thinking=None):
         """Render messages to token ids for L3."""
         msgs = normalize_messages_for_template(messages)
         tok = self.eng.tokenizer
         kw = {"tools": tools} if tools else {}
+        if enable_thinking is not None:
+            kw["enable_thinking"] = bool(enable_thinking)
         prompt_ids = tok.apply_chat_template(
             msgs, add_generation_prompt=add_generation_prompt, **kw
         )
         return prompt_ids
+
+    def _effective_enable_thinking(self, override):
+        if override is None:
+            return self._default_enable_thinking
+        return bool(override)
+
+    @staticmethod
+    def _load_default_enable_thinking(model_path):
+        try:
+            path = Path(model_path).expanduser() / "mtplx_runtime.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        runtime = data.get("runtime") if isinstance(data, dict) else None
+        if isinstance(runtime, dict) and isinstance(runtime.get("enable_thinking"), bool):
+            return runtime["enable_thinking"]
+        if isinstance(data, dict) and isinstance(data.get("enable_thinking"), bool):
+            return data["enable_thinking"]
+        return None
+
+    def _prompt_opens_thinking(self, prompt_ids) -> bool:
+        try:
+            prompt_text = self.eng.tokenizer.decode(
+                list(prompt_ids), skip_special_tokens=False
+            )
+        except TypeError:
+            prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
+        except Exception:
+            return False
+        open_index = prompt_text.rfind("<think>")
+        if open_index < 0:
+            return False
+        close_index = prompt_text.rfind("</think>")
+        return close_index < open_index
 
     def _stream_prompt_ids(self, prompt_ids, max_tokens):
         """Yield decoded text deltas for one request until it finishes. If the

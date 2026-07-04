@@ -7,6 +7,7 @@ lives apart from the engine/scheduler layers.
 """
 
 from .adapter import normalize_messages_for_template
+from .thinking import ThinkingParser, extract_thinking
 from .tool_calling import (
     ToolCallExtraction,
     ToolCallStreamFilter,
@@ -15,8 +16,10 @@ from .tool_calling import (
 )
 
 __all__ = [
+    "ThinkingParser",
     "ToolCallExtraction",
     "ToolCallStreamFilter",
+    "extract_thinking",
     "extract_tool_calls_with_thinking",
     "normalize_messages_for_template",
     "parse_tool_calls",

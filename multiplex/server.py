@@ -146,27 +146,46 @@ def _sse(data, event=None):
     return f"{head}data: {json.dumps(data)}\n\n"
 
 
-def _stream_visible(backend, messages, max_tokens, tools):
-    """Yield (visible_text_chunk, tool_calls). Visible chunks come as generated,
-    with tool-call markup filtered out by the bridge when tools are offered; the
-    final yield has an empty chunk and the tool_calls parsed from the full text
-    (the oMLX contract: filter markup live, parse tool calls at completion)."""
+def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=None):
+    """Yield (visible_text, reasoning_text, tool_calls)."""
     filt = ToolCallStreamFilter() if tools else None
     full = ""
-    for text in backend.stream_messages(messages, max_tokens, tools):
+    for field, text in backend.stream_message_parts(
+        messages, max_tokens, tools, enable_thinking=enable_thinking
+    ):
+        if field == "reasoning_content":
+            if text:
+                yield "", text, None
+            continue
         full += text
         visible = filt.feed(text) if filt else text
         if visible:
-            yield visible, None
+            yield visible, "", None
     if filt:
         tail = filt.finish()
         if tail:
-            yield tail, None
+            yield tail, "", None
         _, calls = _split_tool_calls(full, tools)
-        yield "", calls
+        yield "", "", calls
 
 
-def _chat_stream(backend, messages, max_tokens, tools=None):
+def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None):
+    content_parts = []
+    reasoning_parts = []
+    calls = []
+    for visible, reasoning, tool_calls in _stream_visible(
+        backend, messages, max_tokens, tools, enable_thinking=enable_thinking
+    ):
+        if visible:
+            content_parts.append(visible)
+        if reasoning:
+            reasoning_parts.append(reasoning)
+        if tool_calls:
+            calls = tool_calls
+    return "".join(content_parts), "".join(reasoning_parts), calls
+
+
+def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=None):
     rid, created = _hex("chatcmpl-"), int(time.time())
 
     def chunk(delta, finish=None):
@@ -178,7 +197,11 @@ def _chat_stream(backend, messages, max_tokens, tools=None):
 
     yield chunk({"role": "assistant"})
     calls = []
-    for visible, tool_calls in _stream_visible(backend, messages, max_tokens, tools):
+    for visible, reasoning, tool_calls in _stream_visible(
+        backend, messages, max_tokens, tools, enable_thinking=enable_thinking
+    ):
+        if reasoning:
+            yield chunk({"reasoning_content": reasoning})
         if visible:
             yield chunk({"content": visible})
         if tool_calls:
@@ -193,7 +216,8 @@ def _chat_stream(backend, messages, max_tokens, tools=None):
     yield "data: [DONE]\n\n"
 
 
-def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=None):
+def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=None,
+                      *, enable_thinking=None):
     rid, mid = _hex("resp_"), _hex("msg_")
     base = {"id": rid, "object": "response", "model": backend.model_id}
     message_item = {"id": mid, "type": "message", "role": "assistant",
@@ -205,7 +229,9 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
                "response.output_item.added")
 
     full, calls = "", []
-    for visible, tool_calls in _stream_visible(backend, messages, max_tokens, tools):
+    for visible, _reasoning, tool_calls in _stream_visible(
+        backend, messages, max_tokens, tools, enable_thinking=enable_thinking
+    ):
         if visible:
             full += visible
             yield _sse({"type": "response.output_text.delta", "item_id": mid, "delta": visible},
@@ -245,8 +271,10 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
 
 
 # --- non-stream bodies --------------------------------------------------------
-def _chat_body(backend, text, tool_calls=None):
+def _chat_body(backend, text, tool_calls=None, reasoning_content=None):
     message = {"role": "assistant", "content": text or None}
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
     if tool_calls:
         message["tool_calls"] = tool_calls
     return {
@@ -337,24 +365,37 @@ def make_handler(backend: Hub):
                              or body.get("max_tokens") or 2048)
 
             tools = body.get("tools")
+            enable_thinking = body.get("enable_thinking")
+            if not isinstance(enable_thinking, bool):
+                enable_thinking = None
             if path == "/v1/chat/completions":
                 msgs = _messages_from_chat(body)
                 if stream:
-                    self._sse_stream(_chat_stream(backend, msgs, max_tokens, tools))
+                    self._sse_stream(_chat_stream(
+                        backend, msgs, max_tokens, tools,
+                        enable_thinking=enable_thinking,
+                    ))
                 else:
-                    text = "".join(backend.stream_messages(msgs, max_tokens, tools))
-                    clean, calls = _split_tool_calls(text, tools)
-                    self._json(200, _chat_body(backend, clean, calls))
+                    clean, reasoning, calls = _collect_parts(
+                        backend, msgs, max_tokens, tools,
+                        enable_thinking=enable_thinking,
+                    )
+                    self._json(200, _chat_body(
+                        backend, clean, calls, reasoning_content=reasoning
+                    ))
             elif path == "/v1/responses":
                 msgs = response_messages(body)
                 if stream:
                     self._sse_stream(_responses_stream(
                         backend, msgs, max_tokens, tools,
                         on_complete=lambda rid, out: remember_response(rid, msgs + out),
+                        enable_thinking=enable_thinking,
                     ))
                 else:
-                    text = "".join(backend.stream_messages(msgs, max_tokens, tools))
-                    clean, calls = _split_tool_calls(text, tools)
+                    clean, _reasoning, calls = _collect_parts(
+                        backend, msgs, max_tokens, tools,
+                        enable_thinking=enable_thinking,
+                    )
                     resp = _responses_body(backend, clean, calls)
                     remember_response(resp["id"], msgs + _assistant_messages(clean, calls))
                     self._json(200, resp)
