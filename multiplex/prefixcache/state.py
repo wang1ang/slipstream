@@ -22,11 +22,15 @@ if TYPE_CHECKING:
     from .policy import Match
 
 
+COMBINED_BLOCK_VERSION = 1
+
+
 @dataclass
 class RestoredPrefix:
     state: BatchState
     pos: int
     cached_h: Any | None = None
+    mtp_blocks: list[Any] | None = None
 
 
 class PrefixCacheState:
@@ -73,6 +77,31 @@ class PrefixCacheState:
             mx.eval(*leaves)
         return snap
 
+    @staticmethod
+    def pack_cache_block(attn, mtp=None):
+        # Policy/disk see one opaque block payload; trunk and MTP deltas must
+        # move together so restore cannot warm one cache and cold-start the other.
+        if mtp is None:
+            return attn
+        return (COMBINED_BLOCK_VERSION, attn, mtp)
+
+    def split_cache_blocks(self, blocks: list[Any]) -> tuple[list[Any], list[Any] | None]:
+        attn_blocks = []
+        mtp_blocks: list[Any] | None = []
+        for block in blocks:
+            if (
+                isinstance(block, tuple)
+                and len(block) == 3
+                and block[0] == COMBINED_BLOCK_VERSION
+            ):
+                attn_blocks.append(block[1])
+                if mtp_blocks is not None:
+                    mtp_blocks.append(block[2])
+            else:
+                attn_blocks.append(block)
+                mtp_blocks = None
+        return attn_blocks, mtp_blocks
+
     def restore_match(self, match: "Match") -> RestoredPrefix:
         """Restore the block-tree payload returned by policy.find()."""
         payload = match.payload
@@ -81,8 +110,14 @@ class PrefixCacheState:
             raise ValueError(f"unsupported prefix-cache payload: {kind!r}")
         _kind, blocks, ssm, pos = payload[:4]
         cached_h = payload[4] if len(payload) > 4 else None
-        state = self.restore_blocks(blocks, ssm, pos)
-        return RestoredPrefix(state=state, pos=int(pos), cached_h=cached_h)
+        attn_blocks, mtp_blocks = self.split_cache_blocks(blocks)
+        state = self.restore_blocks(attn_blocks, ssm, pos)
+        return RestoredPrefix(
+            state=state,
+            pos=int(pos),
+            cached_h=cached_h,
+            mtp_blocks=mtp_blocks,
+        )
 
     def restore_blocks(self, blocks: list[Any], ssm_snapshot, pos: int) -> BatchState:
         """Rebuild state by concatenating attention block deltas and applying SSM."""

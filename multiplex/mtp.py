@@ -26,7 +26,7 @@ import json
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, BatchKVCache
 from mlx_lm.models.base import create_attention_mask
 import mlx_lm.models.qwen3_5 as q5
 
@@ -200,13 +200,110 @@ class Drafter:
         return [KVCache()]
 
     @staticmethod
+    def trim_cache_to(cache: list, size: int) -> None:
+        target = max(0, int(size))
+        cur = int(cache[0].size())
+        if cur > target:
+            cache[0].trim(cur - target)
+
+    def merge_caches(self, caches: list[list]) -> list:
+        if not caches:
+            return self.make_cache()
+        if len(caches) == 1:
+            return caches[0]
+        return [BatchKVCache.merge([cache[0] for cache in caches])]
+
+    @staticmethod
+    def extract_cache_row(cache: list, row: int) -> list:
+        c = cache[0]
+        if hasattr(c, "extract"):
+            return [c.extract(row)]
+        single = KVCache()
+        if c.keys is not None:
+            single.keys = mx.contiguous(c.keys[row:row + 1, :, :c.offset, :])
+            single.values = mx.contiguous(c.values[row:row + 1, :, :c.offset, :])
+            single.offset = int(c.offset)
+        return [single]
+
+    @staticmethod
     def filter_cache(cache: list, keep: list[int]) -> None:
         """Keep only rows ``keep`` in the draft KVCache. Plain KVCache has no
         filter(), so slice its [B, H, L, D] keys/values by row."""
-        for c in cache:
-            if c.keys is not None:
-                c.keys = c.keys[keep]
-                c.values = c.values[keep]
+        c = cache[0]
+        if hasattr(c, "filter"):
+            c.filter(keep)
+        elif c.keys is not None:
+            c.keys = c.keys[keep]
+            c.values = c.values[keep]
+
+    @staticmethod
+    def _row_view(c, row: int | None = None):
+        if isinstance(c, BatchKVCache):
+            if row is None:
+                if int(c.left_padding.shape[0]) != 1:
+                    raise ValueError("row is required for batched MTP cache blocks")
+                row = 0
+            pad = int(c.left_padding[row])
+            end = int(c._idx)
+            return (
+                c.keys[row:row + 1, :, pad:end, :],
+                c.values[row:row + 1, :, pad:end, :],
+                end - pad,
+            )
+        n = int(c.offset)
+        if row is None:
+            return c.keys[..., :n, :], c.values[..., :n, :], n
+        return c.keys[row:row + 1, :, :n, :], c.values[row:row + 1, :, :n, :], n
+
+    def clone_cache_block(self, cache: list, start: int, pos: int, *,
+                          row: int | None = None):
+        """Clone MTP KV deltas needed for trunk prefix ``[start:pos]``.
+
+        MTP history for a trunk prefix of length ``pos`` contains transitions
+        for token positions ``1..pos-1``. A trunk cache block ``[start:pos]``
+        therefore contributes MTP slots ``max(1, start)..pos-1``.
+        """
+        start = int(start)
+        pos = int(pos)
+        mtp_start = max(1, start) - 1
+        mtp_end = max(0, pos - 1)
+        if mtp_end <= mtp_start:
+            return [None]
+        keys, values, length = self._row_view(cache[0], row=row)
+        if mtp_end > length:
+            raise ValueError(
+                f"invalid MTP block slice [{mtp_start}:{mtp_end}] "
+                f"for length={length}"
+            )
+        k = keys[..., mtp_start:mtp_end, :] + 0
+        v = values[..., mtp_start:mtp_end, :] + 0
+        mx.eval(k, v)
+        return [[k, v]]
+
+    def restore_cache_blocks(self, blocks: list) -> list:
+        cache = self.make_cache()
+        parts = [block[0] for block in blocks if block[0] is not None]
+        if not parts:
+            return cache
+        keys = mx.concatenate([p[0] for p in parts], axis=2) \
+            if len(parts) > 1 else parts[0][0] + 0
+        values = mx.concatenate([p[1] for p in parts], axis=2) \
+            if len(parts) > 1 else parts[0][1] + 0
+        mx.eval(keys, values)
+        cache[0].state = [keys, values]
+        return cache
+
+    def append_history(self, cache: list, hidden: mx.array, tokens) -> None:
+        """Append committed MTP-history transitions without sampling drafts."""
+        if hidden is None or int(hidden.shape[1]) == 0:
+            return
+        tok = tokens if hasattr(tokens, "shape") else mx.array(tokens, dtype=mx.int32)
+        if len(tok.shape) == 1:
+            tok = tok[None, :]
+        if int(tok.shape[1]) == 0:
+            return
+        post = self.head(self.embed(tok), hidden, cache[0])
+        mx.eval(post, *cache[0].state)
 
     def draft(self, hidden: mx.array, tokens: mx.array, k: int, cache: list) -> mx.array:
         """Draft k tokens per row (greedy). Returns draft tokens ``[B, k]``.

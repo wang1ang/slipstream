@@ -54,6 +54,8 @@ class PrefillGroup:
     pos: int = 0
     cacheable: bool = False
     cached_h: object = None
+    dcache: object = None
+    mtp_prev_h: object = None
     started: bool = False
 
 
@@ -72,7 +74,7 @@ class Scheduler:
         self._t = 0
         self.output_log_dir = Path(output_log_dir) if output_log_dir else None
         self.prefix_cache = PrefixCacheRuntime(
-            engine, capacity=prefix_cache, disk_dir=prefix_cache_dir,
+            engine, drafter=drafter, capacity=prefix_cache, disk_dir=prefix_cache_dir,
             chunk=chunk, log=self._log,
         )
 
@@ -125,6 +127,7 @@ class Scheduler:
             h = eng.prefill_piece(group.state, ids[start:end], len(ids),
                                   log=self._log)
             group.pos = end
+            self._append_prefill_mtp_history(group, ids, start, end, h)
             self.prefix_cache.store_prompt_block(req, group, ids, start, end, h)
             if cancelled and cancelled(req.rid):
                 self._log(f"PREFILL CANCELLED rid={req.rid}")
@@ -145,25 +148,29 @@ class Scheduler:
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge one prefilled request into the live batch."""
-        singles, hs, prims, reqs = [], [], [], []
+        singles, hs, prims, reqs, dcaches = [], [], [], [], []
         for i, req in enumerate(self.rows):        # existing rows -> singles
             singles.append(self.eng.extract_row(self.state, i))
             hs.append(self.h[i:i + 1])
             prims.append(self.primary[i:i + 1])
             reqs.append(req)
+            if self.dr is not None:
+                dcaches.append(self.dr.extract_cache_row(self.dcache, i))
         joined = []
         r = group.req
         singles.append(group.single)
         hs.append(group.last_h)
         prims.append(mx.array([group.first]))
         reqs.append(r)
+        if self.dr is not None:
+            dcaches.append(group.dcache or self.dr.make_cache())
         joined.append((r.rid, group.first))
         self.state = self.eng.merge_states(singles)
         self.h = mx.concatenate(hs, axis=0)
         self.primary = mx.concatenate(prims, axis=0)
         self.rows = reqs
-        if self.dr is not None:                    # merge resets the draft cache
-            self.dcache = self.dr.make_cache()
+        if self.dr is not None:
+            self.dcache = self.dr.merge_caches(dcaches)
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
 
@@ -180,6 +187,7 @@ class Scheduler:
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
         else:
+            dcache_base = int(self.dcache[0].size())
             drafts = dr.draft(h, primary, k, self.dcache)
             draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
 
@@ -214,6 +222,12 @@ class Scheduler:
             emitted.append((rows[i].rid, toks))
 
         primary = trunk_pred[:, m]
+        if k != 0:
+            dr.trim_cache_to(self.dcache, dcache_base + 1)
+            if m:
+                accepted = mx.array([draft_ids[i][:m] for i in range(B)],
+                                    dtype=mx.int32)
+                dr.append_history(self.dcache, vhidden[:, :m, :], accepted)
         if m == k:
             h = vhidden[:, -1:, :]
         else:
@@ -236,7 +250,7 @@ class Scheduler:
         self._log(f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m} "
                   f"{prob_text} {tok_s:.0f} tok/s")
         self.state, self.h, self.primary = state, h, primary
-        self.prefix_cache.capture_session_blocks(rows, state)
+        self.prefix_cache.capture_session_blocks(rows, state, dcache=self.dcache, h=h)
 
         if finished:
             self._log(f"EXIT {[rows[i].rid for i in finished]}")
@@ -244,6 +258,25 @@ class Scheduler:
             self.prefix_cache.prune_unreferenced()
 
         return emitted
+
+    def _append_prefill_mtp_history(self, group: PrefillGroup, ids: list[int],
+                                    start: int, end: int, h) -> None:
+        if self.dr is None or group.dcache is None:
+            return
+        hidden_parts = []
+        token_parts = []
+        if start > 0 and group.mtp_prev_h is not None:
+            hidden_parts.append(group.mtp_prev_h)
+            token_parts.append(int(ids[start]))
+        local = max(0, end - start - 1)
+        if local:
+            hidden_parts.append(h[:, :local, :])
+            token_parts.extend(int(t) for t in ids[start + 1:end])
+        if hidden_parts:
+            hidden = mx.concatenate(hidden_parts, axis=1) \
+                if len(hidden_parts) > 1 else hidden_parts[0]
+            self.dr.append_history(group.dcache, hidden, token_parts)
+        group.mtp_prev_h = h[:, -1:, :]
 
     def _bonus_probs(self, logits, pred, pos: int) -> list[float]:
         probs = mx.softmax(logits[:, pos, :], axis=-1)

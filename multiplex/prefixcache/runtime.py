@@ -27,12 +27,14 @@ class PrefixCacheRuntime:
         self,
         engine: Engine,
         *,
+        drafter=None,
         capacity: int | dict[str, int] = 8,
         disk_dir=None,
         chunk: int = 512,
         log=None,
     ) -> None:
         self.engine = engine
+        self.drafter = drafter
         self.chunk = chunk
         self.log = log
         cache_dir = self._cache_dir(disk_dir)
@@ -73,6 +75,16 @@ class PrefixCacheRuntime:
             return
 
         restored = self.state.restore_match(match)
+        if self.drafter is not None:
+            needs_boundary_h = 0 < restored.pos < len(ids)
+            if restored.mtp_blocks is None or (needs_boundary_h and restored.cached_h is None):
+                self._cold_prefill(req, group, ids, log=False)
+                self._log(
+                    f"PREFIX HIT without MTP history; cold rerun rid={req.rid}"
+                )
+                return
+            group.dcache = self.drafter.restore_cache_blocks(restored.mtp_blocks)
+            group.mtp_prev_h = restored.cached_h
         group.state = restored.state
         group.pos = restored.pos
         group.cached_h = restored.cached_h
@@ -92,7 +104,10 @@ class PrefixCacheRuntime:
             return
         if not (group.cacheable or req.session_cache):
             return
-        attn = self.state.clone_attention_block(group.state, start, end)
+        block_payload = self._pack_block(
+            self.state.clone_attention_block(group.state, start, end),
+            getattr(group, "dcache", None), start, end,
+        )
         ssm = None
         source = None
         cached_h = None
@@ -100,18 +115,18 @@ class PrefixCacheRuntime:
             ssm = self.state.clone_ssm(group.state.cache)
             block = end // self.chunk
             source = f"prompt rid={req.rid} block={block}"
-            cached_h = h[:, -1:, :] if end == len(ids) else None
-            if cached_h is not None:
-                mx.eval(cached_h)
+            cached_h = h[:, -1:, :]
+            mx.eval(cached_h)
         stored = self.cache.store_block(
-            ids, start, end, attn, ssm=ssm, source=source,
+            ids, start, end, block_payload, ssm=ssm, source=source,
             pool="prompt", cached_h=cached_h,
         )
         if stored and ssm is not None:
             self._log(f"PREFIX STORE block={end // self.chunk} "
                       f"len={end}/{len(ids)} rid={req.rid}")
 
-    def capture_session_blocks(self, rows: list[Any], state: BatchState) -> None:
+    def capture_session_blocks(self, rows: list[Any], state: BatchState, *,
+                               dcache=None, h=None) -> None:
         if self.cache is None or self.state is None or not self.chunk:
             return
         for i, req in enumerate(rows):
@@ -129,13 +144,19 @@ class PrefixCacheRuntime:
             if len(prefix) < pos or start < 0:
                 continue
             prefix = prefix[:pos]
-            attn = self.state.clone_attention_block(single, start, pos)
+            block_payload = self._pack_block(
+                self.state.clone_attention_block(single, start, pos),
+                dcache, start, pos, row=i,
+            )
             ssm = self.state.clone_ssm(single.cache)
+            cached_h = h[i:i + 1] if h is not None else None
+            if cached_h is not None:
+                mx.eval(cached_h)
             block = pos // self.chunk
             if self.cache.store_block(
-                prefix, start, pos, attn, ssm=ssm,
+                prefix, start, pos, block_payload, ssm=ssm,
                 source=f"session rid={req.rid} block={block}",
-                pool="session",
+                pool="session", cached_h=cached_h,
             ):
                 req.session_cache_pos.add(pos)
                 self._log(f"SESSION STORE block={block} len={pos} rid={req.rid}")
@@ -148,8 +169,16 @@ class PrefixCacheRuntime:
                       log: bool = True) -> None:
         group.state = BatchState(cache=self.engine._make_empty_cache(), lengths=[0])
         group.pos = 0
+        group.dcache = self.drafter.make_cache() if self.drafter is not None else None
+        group.mtp_prev_h = None
         if log:
             self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
+
+    def _pack_block(self, attn, dcache, start: int, pos: int, *, row=None):
+        if self.drafter is None or dcache is None:
+            return attn
+        mtp = self.drafter.clone_cache_block(dcache, start, pos, row=row)
+        return self.state.pack_cache_block(attn, mtp)
 
     def _log_find(self, req: Any, ids: list[int], match) -> None:
         if self.cache is None:
