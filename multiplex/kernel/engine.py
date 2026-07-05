@@ -79,17 +79,12 @@ class Engine:
         """A fresh single-row cache (all layers) to prefill into from scratch."""
         return _make_cache(self.model, [0], None)
 
-    def prefill(self, state: BatchState, ids: list[int], total: int, *,
-                log=None) -> mx.array:
+    def prefill(self, state: BatchState, ids: list[int]) -> mx.array:
         """Feed one prefill piece into a single-row state."""
         piece = mx.array([ids], dtype=mx.int32)
-        t0 = time.time()
         h = self.model.language_model.model(piece, cache=state.cache)
         mx.eval(h, *(c.state for c in state.cache))
         state.lengths[0] += len(ids)
-        if log:
-            dt = time.time() - t0
-            log(f"prefill {state.lengths[0]}/{total} tok {len(ids) / dt:.0f} tok/s")
         return h
 
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:

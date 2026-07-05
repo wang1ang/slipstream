@@ -126,9 +126,14 @@ class Scheduler:
         if h is None:
             start = group.pos
             end = min(start + self.chunk, len(ids)) if self.chunk else len(ids)
-            h = eng.prefill(group.state, ids[start:end], len(ids),
-                            log=self._log)
+            t0 = time.time()
+            h = eng.prefill(group.state, ids[start:end])
             group.pos = end
+            dt = max(time.time() - t0, 1e-9)
+            self._log(
+                f"prefill {group.state.lengths[0]}/{len(ids)} tok "
+                f"{(end - start) / dt:.0f} tok/s"
+            )
             self._append_prefill_mtp_history(group, ids, start, end, h)
             self.prefix_cache.store_prompt_block(req, group, ids, start, end, h)
             if cancelled and cancelled(req.rid):
@@ -143,13 +148,27 @@ class Scheduler:
 
         req.out.append(first)
         self._log_output(req, [first])
-        group.single = eng.extract_row(group.state, 0)
+        group.single = group.state
         group.first = first
         group.last_h = h
         return True
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge one prefilled request into the live batch."""
+        r = group.req
+        joined = [(r.rid, group.first)]
+
+        # First row can keep its single-row cache; avoid rebuilding long KV.
+        if not self.rows:
+            self.state = group.single
+            self.h = group.last_h
+            self.primary = mx.array([group.first])
+            self.rows = [r]
+            if self.dr is not None:
+                self.dcache = group.dcache or self.dr.make_cache()
+            self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
+            return joined
+
         singles, hs, prims, reqs, dcaches = [], [], [], [], []
         for i, req in enumerate(self.rows):        # existing rows -> singles
             singles.append(self.eng.extract_row(self.state, i))
@@ -158,15 +177,12 @@ class Scheduler:
             reqs.append(req)
             if self.dr is not None:
                 dcaches.append(self.dr.extract_cache_row(self.dcache, i))
-        joined = []
-        r = group.req
         singles.append(group.single)
         hs.append(group.last_h)
         prims.append(mx.array([group.first]))
         reqs.append(r)
         if self.dr is not None:
             dcaches.append(group.dcache or self.dr.make_cache())
-        joined.append((r.rid, group.first))
         self.state = self.eng.merge_states(singles)
         self.h = mx.concatenate(hs, axis=0)
         self.primary = mx.concatenate(prims, axis=0)
@@ -193,7 +209,7 @@ class Scheduler:
             drafts = dr.draft(h, primary, k, self.dcache)
             draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
 
-        snap = eng.snapshot_ssm(state)
+        snap = eng.snapshot_ssm(state) if k else None
         lengths_before = list(state.lengths)
         verify_in = mx.array([[int(primary[i])] + draft_ids[i] for i in range(B)])
         vhidden = eng.forward(state, verify_in)
