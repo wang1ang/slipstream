@@ -47,10 +47,15 @@ class RequestManager:
         self._rid = 0
         self._decode = decode
 
-    def submit(self, prompt_ids, max_tokens) -> tuple[Req, queue.Queue]:
+    def submit(self, prompt_ids, max_tokens, *, temperature=None,
+               top_p=None, top_k=None) -> tuple[Req, queue.Queue]:
         q: queue.Queue = queue.Queue()
         with self._lock:
-            req = Req(self._rid, list(prompt_ids), max_tokens, session_cache=True)
+            req = Req(
+                self._rid, list(prompt_ids), max_tokens,
+                temperature=temperature, top_p=top_p, top_k=top_k,
+                session_cache=True,
+            )
             self._rid += 1
             self._incoming.append(req)
             self._queues[req.rid] = q
@@ -161,10 +166,18 @@ class Hub:
             add_generation_prompt=add_generation_prompt,
             enable_thinking=effective_enable_thinking,
         )
-        thinking = ThinkingParser(
-            starts_in_thinking=self._prompt_opens_thinking(prompt_ids)
-        )
-        for raw_delta in self._stream_prompt_ids(prompt_ids, max_tokens):
+        starts_in_thinking = self._prompt_opens_thinking(prompt_ids)
+        if starts_in_thinking or effective_enable_thinking is True:
+            temperature, top_p, top_k = 0.6, 0.95, 20
+        elif effective_enable_thinking is False:
+            temperature, top_p, top_k = 0.7, 0.8, 20
+        else:
+            temperature = top_p = top_k = None
+        thinking = ThinkingParser(starts_in_thinking=starts_in_thinking)
+        for raw_delta in self._stream_prompt_ids(
+            prompt_ids, max_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+        ):
             reasoning_delta, content_delta = thinking.feed(raw_delta)
             if reasoning_delta:
                 yield "reasoning_content", reasoning_delta
@@ -223,12 +236,16 @@ class Hub:
         close_index = prompt_text.rfind("</think>")
         return close_index < open_index
 
-    def _stream_prompt_ids(self, prompt_ids, max_tokens):
+    def _stream_prompt_ids(self, prompt_ids, max_tokens, *,
+                           temperature=None, top_p=None, top_k=None):
         """Yield decoded text deltas for one request until it finishes. If the
         consumer stops early (client disconnects -> the SSE handler stops
         iterating -> this generator is closed), mark the request cancelled so the
         engine thread drops it instead of finishing generation for no one."""
-        r, q = self._requests.submit(prompt_ids, max_tokens)
+        r, q = self._requests.submit(
+            prompt_ids, max_tokens,
+            temperature=temperature, top_p=top_p, top_k=top_k,
+        )
         self._write_request_log(r, prompt_ids)
         completed = False
         try:

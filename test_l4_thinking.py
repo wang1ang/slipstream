@@ -1,7 +1,10 @@
 import json
 
 from multiplex.hub import Hub
-from multiplex.server import _chat_stream, _enable_thinking_from_body
+from multiplex.server import (
+    _chat_stream,
+    _enable_thinking_from_body,
+)
 
 
 def _ids(text: str) -> list[int]:
@@ -29,8 +32,20 @@ def _hub_with_raw_chunks(chunks):
     hub = Hub.__new__(Hub)
     hub.tokenizer = TinyTokenizer()
     hub._default_enable_thinking = None
-    hub._stream_prompt_ids = lambda _prompt_ids, _max_tokens: iter(chunks)
+    hub._stream_prompt_ids = lambda _prompt_ids, _max_tokens, **_kw: iter(chunks)
     return hub
+
+
+def _hub_recording_decode_params():
+    calls = []
+    hub = _hub_with_raw_chunks(["ok"])
+
+    def stream(_prompt_ids, _max_tokens, **kwargs):
+        calls.append(kwargs)
+        return iter(["ok"])
+
+    hub._stream_prompt_ids = stream
+    return hub, calls
 
 
 def test_l4_splits_prefilled_qwen_thinking_before_l5():
@@ -105,3 +120,17 @@ def test_l5_enable_thinking_overrides_reasoning_effort():
         "enable_thinking": True,
         "reasoning": {"effort": "low"},
     }) is True
+
+
+def test_l4_sets_decode_params_from_thinking_state():
+    cases = [
+        ({"enable_thinking": True}, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
+        ({}, {"temperature": 0.6, "top_p": 0.95, "top_k": 20}),
+        ({"enable_thinking": False}, {"temperature": 0.7, "top_p": 0.8, "top_k": 20}),
+    ]
+    for kwargs, expected in cases:
+        hub, calls = _hub_recording_decode_params()
+        list(hub.stream_message_parts(
+            [{"role": "user", "content": "hi"}], 8, **kwargs
+        ))
+        assert calls == [expected]

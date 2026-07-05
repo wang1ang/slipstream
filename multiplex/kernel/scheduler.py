@@ -32,6 +32,9 @@ class Req:
     rid: int
     prompt: list[int]
     max_tokens: int
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
     # L4 marks chat/session requests so L3 can store generated block snapshots.
     # Direct callers/tests can leave this off and only use prompt block caching.
     session_cache: bool = False
@@ -220,7 +223,8 @@ class Scheduler:
         for i in range(B):
             a = 0
             for j in range(k):
-                if draft_ids[i][j] == int(trunk_pred[i, j]):
+                if self._accept_draft(rows[i], trunk_logits[i, j, :],
+                                      int(trunk_pred[i, j]), draft_ids[i][j]):
                     a += 1
                 else:
                     break
@@ -302,6 +306,14 @@ class Scheduler:
             round(float(probs[i, int(pred[i, pos])]), 4)
             for i in range(int(pred.shape[0]))
         ]
+
+    def _accept_draft(self, req: Req, logits, best: int, draft: int) -> bool:
+        """Hook for future relaxed MTP acceptance.
+
+        The per-request knobs already live on Req; current behavior stays
+        strict and identical to argmax verify.
+        """
+        return draft == best
 
     def _log_output(self, req: Req, toks: list[int]) -> None:
         if self.output_log_dir is None or self.output_decode is None:
