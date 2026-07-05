@@ -24,8 +24,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .bridge import ToolCallStreamFilter, extract_tool_calls_with_thinking
-from .hub import Hub
-from .mtp import find_mtp
+from .kernel.hub import Hub
+from .kernel.mtp import find_mtp
 
 
 def _split_tool_calls(text, tools):
@@ -422,7 +422,7 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
     httpd.serve_forever()
 
 
-if __name__ == "__main__":
+def main():
     import argparse
     import sys
 
@@ -451,3 +451,7 @@ if __name__ == "__main__":
         sys.exit(str(e))
     serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug,
           prefix_cache_dir=args.prefix_cache_dir)
+
+
+if __name__ == "__main__":
+    main()

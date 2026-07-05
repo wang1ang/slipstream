@@ -16,7 +16,6 @@ logs/
 requirements.txt
 smoke_engine.py
 test_scheduler.py
-multiplex/bridge/thinking.py
 
 # build artifacts
 dist/

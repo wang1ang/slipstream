@@ -6,6 +6,12 @@ Local OpenAI-compatible LLM serving for Apple Silicon, built on `mlx-lm`.
 repeat, and long conversations are resent often. It combines a small HTTP server,
 a dynamic-batch scheduler, MTP speculative decoding, and prefix-cache reuse.
 
+## Architecture
+
+The stable L1-L4 inference kernel lives in `multiplex/kernel/`. L5 stays in
+`multiplex/server.py` because it owns HTTP/OpenAI-compatible protocol concerns.
+See `docs/ARCHITECTURE.md` for the layer and dependency boundaries.
+
 ## Features
 
 - OpenAI-compatible `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/responses`.
