@@ -1,20 +1,17 @@
 """L1 — engine layer.
 
-The lowest layer. Its only job: run correct batched forward passes and manage
-the batched cache. It does NOT sample or make scheduling decisions. It gives
+The lowest layer. Its only job: run correct forward passes and manage the
+batched cache. It does NOT sample or make scheduling decisions. It gives
 whatever token tensor it is fed a correct forward.
 
 Two capabilities, nothing more:
-  * batch: process B sequences together in one forward.
-  * next-k: feed k tokens per row at once and return all k positions' logits
-    (k=1 and k>1 are the same primitive here).
+  * serial prefill: feed one prompt piece into one row.
+  * batched decode/verify: feed q tokens per row and return all q positions'
+    logits (q=1 and q>1 are the same primitive here).
 
 Correctness facts (verified by experiment):
-  * Batched forward of this hybrid SSM+attention model is numerically EXACT vs
-    single-sequence when rows are equal length. Verified token-for-token.
-  * Unequal-length prefill is handled by right-padding + masking. An mlx-lm bug
-    left SSM padding unmasked (see prefill() for the fix); with the fix, the pad
-    positions are correctly masked and do NOT corrupt the recurrent state.
+  * Batched decode/verify of this hybrid SSM+attention model is numerically
+    EXACT vs single-sequence when rows are equal length. Verified token-for-token.
   * Residual divergence between a batched row and the same sequence run alone is
     pure floating-point accumulation (batch reduction order differs from B=1).
     This is inherent to batched inference — NOT a bug — and both trajectories are
@@ -33,7 +30,7 @@ from typing import Any
 
 import mlx.core as mx
 from mlx_lm import load
-from mlx_lm.generate import _make_cache, _right_pad_prompts
+from mlx_lm.generate import _make_cache
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 
@@ -69,11 +66,6 @@ class Engine:
         self.model_path = model_path
         self.load_seconds = time.time() - t0
 
-    # --- tokenization ---
-    def encode(self, text: str) -> list[int]:
-        return self.tokenizer.encode(text)
-
-
     def decode(self, token_ids: list[int]) -> str:
         # skip_special_tokens drops <|im_end|>/<|endoftext|> etc from the text.
         return self.tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -91,54 +83,12 @@ class Engine:
             return lm.model.embed_tokens.as_linear(hidden)
         return lm.lm_head(hidden)
 
-    # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
-    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None,
-                stop=None) -> tuple[BatchState, mx.array]:
-        """Prefill B prompts. Returns (state, hidden ``[B, max_len, H]``).
-
-        Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
-        right-padded to max_len). Returns pre-lm_head hidden; get logits with
-        ``logits(hidden)``. The caller decides how to consume logits.
-
-        A single long prompt whose length exceeds ``chunk`` (>0) is fed in
-        chunks so the attention scratch stays bounded (a 30k-token prompt's
-        full-sequence attention would be tens of GB). The cache accumulates
-        across chunks; only the last chunk's hidden is returned (all the caller
-        needs is the final position). Batched or short prompts take the
-        one-shot path unchanged.
-        """
-        lengths = [len(p) for p in prompts]
-        max_len = max(lengths)
-
-        if chunk and len(prompts) == 1 and max_len > chunk:
-            cache = _make_cache(self.model, [0], None)
-            state = BatchState(cache=cache, lengths=[0])
-            h = self._run_chunked(state, prompts[0], chunk, log=log, stop=stop)
-            return state, h
-
-        padding = [max_len - n for n in lengths]
-        cache = _make_cache(self.model, [0] * len(prompts), None)
-        tokens = _right_pad_prompts(prompts, max_length=max_len)
-        for c in cache:
-            c.prepare(lengths=lengths, right_padding=padding)
-            # mlx-lm bug: _make_cache sets ArraysCache.left_padding = [0,...],
-            # so make_mask() takes the left_padding branch (pos >= 0, always True)
-            # and never masks right-padding — pad tokens corrupt GatedDeltaNet
-            # state. Clearing it forces the lengths branch (pos < lengths), which
-            # masks the pad positions. (padding=0 -> masks nothing, still correct.)
-            if isinstance(c, ArraysCache):
-                c.left_padding = None
-        h = self.model.language_model.model(tokens, cache=cache)
-        for c in cache:
-            c.finalize()
-        return BatchState(cache=cache, lengths=list(lengths)), h
-
     def _make_empty_cache(self) -> list:
         """A fresh single-row cache (all layers) to prefill into from scratch."""
         return _make_cache(self.model, [0], None)
 
-    def prefill_piece(self, state: BatchState, ids: list[int], total: int, *,
-                      log=None) -> mx.array:
+    def prefill(self, state: BatchState, ids: list[int], total: int, *,
+                log=None) -> mx.array:
         """Feed one prefill piece into a single-row state."""
         piece = mx.array([ids], dtype=mx.int32)
         t0 = time.time()
@@ -148,30 +98,6 @@ class Engine:
         if log:
             dt = time.time() - t0
             log(f"prefill {state.lengths[0]}/{total} tok {len(ids) / dt:.0f} tok/s")
-        return h
-
-    def _run_chunked(self, state: BatchState, ids: list[int], chunk: int, *,
-                     log=None, stop=None):
-        """Feed ``ids`` into a single-row ``state`` in chunks (cache accumulates,
-        attention stays incremental so the scratch is bounded). Advances
-        state.lengths; returns the last chunk's hidden. Returns None if stop()
-        fires between chunks."""
-        model = self.model.language_model.model
-        base = state.lengths[0]
-        total = base + len(ids)
-        h = None
-        for s in range(0, len(ids), chunk):
-            piece = mx.array([ids[s:s + chunk]], dtype=mx.int32)
-            t0 = time.time()
-            h = model(piece, cache=state.cache)
-            mx.eval(h, *(c.state for c in state.cache))
-            end = base + min(s + chunk, len(ids))       # absolute position
-            state.lengths[0] = end
-            if log:
-                dt = time.time() - t0
-                log(f"prefill {end}/{total} tok {(min(s + chunk, len(ids)) - s) / dt:.0f} tok/s")
-            if stop and stop():
-                return None
         return h
 
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:

@@ -124,8 +124,8 @@ class Scheduler:
         if h is None:
             start = group.pos
             end = min(start + self.chunk, len(ids)) if self.chunk else len(ids)
-            h = eng.prefill_piece(group.state, ids[start:end], len(ids),
-                                  log=self._log)
+            h = eng.prefill(group.state, ids[start:end], len(ids),
+                            log=self._log)
             group.pos = end
             self._append_prefill_mtp_history(group, ids, start, end, h)
             self.prefix_cache.store_prompt_block(req, group, ids, start, end, h)

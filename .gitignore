@@ -4,7 +4,7 @@ __pycache__/
 .DS_Store
 # docs (not committed for now)
 PLAN.md
-m0-interfaces.html
+*.html
 
 # local-only launcher
 serve-webui.sh
