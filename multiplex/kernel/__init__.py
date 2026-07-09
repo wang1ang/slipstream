@@ -7,7 +7,7 @@ runtime itself must change.
 
 from .engine import BatchState, Engine
 from .hub import Hub
-from .mtp import Drafter, find_mtp
+from .mtp import Drafter, find_drafter, find_mtp
 from .scheduler import PrefillGroup, Req, Scheduler
 
 __all__ = [
@@ -18,5 +18,6 @@ __all__ = [
     "PrefillGroup",
     "Req",
     "Scheduler",
+    "find_drafter",
     "find_mtp",
 ]

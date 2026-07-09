@@ -159,59 +159,75 @@ class MTPHead(nn.Module):
         return self.norm(x)
 
 
+def build_qwen_head(engine, mtp_path: str):
+    """Build the Qwen native-MTP head from a ``mtp.safetensors`` sidecar.
+
+    Returns an object exposing ``__call__(embed, hidden, cache) -> post_hidden``
+    and ``embed`` (the trunk's embed_tokens), which is all ``Drafter`` needs. The
+    head reuses the trunk's own decoder-layer class and shares its output
+    projection via ``engine.logits``.
+    """
+    cfg = engine.model.args.text_config
+    targs = q5.TextModelArgs.from_dict(cfg)
+    head = MTPHead(targs)
+    head.embed = engine.model.language_model.model.embed_tokens
+    qc = _quant_config(engine.model_path)
+
+    raw = mx.load(mtp_path)
+    weights = {k[len("mtp."):]: v for k, v in raw.items() if k.startswith("mtp.")}
+    # MoE trunks store per-expert weights; stack them. Dense heads have no
+    # experts (num_experts falsy) — nothing to stack.
+    if getattr(targs, "num_experts", None):
+        weights = _stack_experts(weights, targs.num_experts)
+
+    # A prequantized head ships .scales/.biases; those exact modules must be
+    # quantized to the SAME scheme BEFORE loading (mirrors mlx-lm's quantized
+    # load). Quantization is MIXED — only the modules that actually carry a
+    # .scales weight are quantized (e.g. fc / norms stay full precision), so
+    # drive it by a predicate over the weight keys, not a blanket quantize.
+    prequant = any(k.endswith(".scales") for k in weights)
+    if prequant:
+        inferred_group_size = _infer_prequant_group_size(weights, qc["bits"])
+        if inferred_group_size is not None:
+            qc["group_size"] = inferred_group_size
+
+        scaled = {k[: -len(".scales")] for k in weights if k.endswith(".scales")}
+
+        def is_quantized(path, _module):
+            return path in scaled and {"group_size": qc["group_size"],
+                                       "bits": qc["bits"], "mode": qc["mode"]}
+
+        nn.quantize(head, class_predicate=is_quantized)
+
+    # strict=False: heads vary by architecture (dense vs MoE, quantized or
+    # not); load what matches and let the module keep its untouched norms.
+    head.load_weights(list(weights.items()), strict=False)
+    if _mtp_norms_are_delta_encoded(engine.model_path):
+        for _, m in head.named_modules():
+            if isinstance(m, nn.RMSNorm):
+                m.weight = m.weight + 1.0
+    # A non-prequantized head is quantized to the model's own scheme (bits
+    # follow the model, not a user knob); prequantized heads are done above.
+    if not prequant:
+        nn.quantize(head, group_size=qc["group_size"], bits=qc["bits"],
+                    mode=qc["mode"])
+    head.eval()
+    return head
+
+
 class Drafter:
-    """Loads the MTP head and drafts tokens against a trunk model."""
+    """Drafts tokens against a trunk model using an injected MTP ``head``.
 
-    def __init__(self, engine, mtp_path: str):
+    The head is model-specific (Qwen native head, Gemma assistant, …) and only
+    needs to expose ``__call__(embed, hidden, cache) -> post_hidden`` plus an
+    ``embed`` attribute. Everything else here — draft-cache management, the draft
+    loop, committed-history append, verify hand-off — is model-agnostic.
+    """
+
+    def __init__(self, engine, head):
         self.engine = engine
-        trunk = engine.model.language_model
-        self.embed = trunk.model.embed_tokens
-        # Draft logits reuse the trunk head via engine.logits (handles tied /
-        # untied); the head shares the trunk's output projection.
-        cfg = engine.model.args.text_config
-        targs = q5.TextModelArgs.from_dict(cfg)
-        self.head = MTPHead(targs)
-        qc = _quant_config(engine.model_path)
-
-        raw = mx.load(mtp_path)
-        weights = {k[len("mtp."):]: v for k, v in raw.items() if k.startswith("mtp.")}
-        # MoE trunks store per-expert weights; stack them. Dense heads have no
-        # experts (num_experts falsy) — nothing to stack.
-        if getattr(targs, "num_experts", None):
-            weights = _stack_experts(weights, targs.num_experts)
-
-        # A prequantized head ships .scales/.biases; those exact modules must be
-        # quantized to the SAME scheme BEFORE loading (mirrors mlx-lm's quantized
-        # load). Quantization is MIXED — only the modules that actually carry a
-        # .scales weight are quantized (e.g. fc / norms stay full precision), so
-        # drive it by a predicate over the weight keys, not a blanket quantize.
-        prequant = any(k.endswith(".scales") for k in weights)
-        if prequant:
-            inferred_group_size = _infer_prequant_group_size(weights, qc["bits"])
-            if inferred_group_size is not None:
-                qc["group_size"] = inferred_group_size
-
-            scaled = {k[: -len(".scales")] for k in weights if k.endswith(".scales")}
-
-            def is_quantized(path, _module):
-                return path in scaled and {"group_size": qc["group_size"],
-                                           "bits": qc["bits"], "mode": qc["mode"]}
-
-            nn.quantize(self.head, class_predicate=is_quantized)
-
-        # strict=False: heads vary by architecture (dense vs MoE, quantized or
-        # not); load what matches and let the module keep its untouched norms.
-        self.head.load_weights(list(weights.items()), strict=False)
-        if _mtp_norms_are_delta_encoded(engine.model_path):
-            for _, m in self.head.named_modules():
-                if isinstance(m, nn.RMSNorm):
-                    m.weight = m.weight + 1.0
-        # A non-prequantized head is quantized to the model's own scheme (bits
-        # follow the model, not a user knob); prequantized heads are done above.
-        if not prequant:
-            nn.quantize(self.head, group_size=qc["group_size"], bits=qc["bits"],
-                        mode=qc["mode"])
-        self.head.eval()
+        self.head = head
+        self.embed = head.embed
 
     def make_cache(self) -> list:
         return [KVCache()]
@@ -341,3 +357,19 @@ class Drafter:
             drafts.append(tok)
             h = post
         return mx.concatenate(drafts, axis=1)
+
+
+def find_drafter(engine):
+    """Build the right MTP drafter for a loaded model, or None for pure AR.
+
+    Unified entry point over the drafter zoo: it picks a head builder by what the
+    model ships, wraps it in the model-agnostic ``Drafter``, and returns that.
+    Add a new MTP family by adding a head builder + a branch here — the draft
+    loop, cache management, and scheduler contract stay shared.
+      * ``mtp.safetensors`` sidecar  -> Qwen native MTP head (build_qwen_head)
+      * (future) assistant-pair bundle -> Gemma external drafter
+    """
+    mtp_path = find_mtp(engine.model_path)
+    if mtp_path is not None:
+        return Drafter(engine, build_qwen_head(engine, mtp_path))
+    return None

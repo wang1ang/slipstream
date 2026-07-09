@@ -55,8 +55,10 @@ python -m multiplex.server --model https://huggingface.co/org/repo
 ```
 
 If `--model` is omitted in an interactive terminal, `multiplex` shows a numbered
-model list and Enter selects the first entry. Non-interactive server runs must
-provide a model when multiple models are present.
+model list and Enter selects the first entry. The list includes a few default
+downloadable models; entries that are not already local are marked `(需下载)`.
+Non-interactive server runs must provide a model when multiple choices are
+available.
 
 MTP sidecars are discovered automatically from `mtplx_runtime.json`,
 `mtp.safetensors`, or `mtp/weights.safetensors`. Models without a sidecar run

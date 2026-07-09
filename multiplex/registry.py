@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 DEFAULT_ROOT = "~/.mtplx/models"
+DEFAULT_MODELS = (
+    "mlx-community/Qwen3-0.6B-4bit",
+    "mlx-community/Qwen3-1.7B-4bit",
+    "mlx-community/Qwen3-4B-4bit",
+    "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
+)
 
 
 @dataclass
@@ -21,16 +27,22 @@ class ModelEntry:
 
 
 def list_models(root: str = DEFAULT_ROOT) -> list[ModelEntry]:
-    """Every immediate subdirectory of ``root`` that has a config.json — that
-    marks it as a model. No weight validation (load-time handles that). Sorted
-    by name for stable listing."""
+    """Every immediate subdirectory of ``root`` that is a model directory.
+
+    A directory counts as a model if it has a ``config.json`` at its root
+    (single-model layout), or a ``mtplx_pair.json`` at its root (assistant-pair
+    bundle: the per-model config.json lives under target/ and assistant/).
+    Discovery only — no weight validation (load-time handles that). Sorted by
+    name for stable listing."""
     root = os.path.expanduser(root)
     if not os.path.isdir(root):
         return []
     entries = []
     for name in sorted(os.listdir(root)):
         path = os.path.join(root, name)
-        if os.path.isfile(os.path.join(path, "config.json")):
+        if os.path.isfile(os.path.join(path, "config.json")) or os.path.isfile(
+            os.path.join(path, "mtplx_pair.json")
+        ):
             entries.append(ModelEntry(name=name, path=path))
     return entries
 
@@ -94,31 +106,48 @@ def resolve(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry | list[Mode
     return models[0] if len(models) == 1 else models
 
 
+def _missing_default_models(models: list[ModelEntry]) -> list[str]:
+    local_names = {e.name for e in models}
+    missing = []
+    for model in DEFAULT_MODELS:
+        repo_id, local_name = _hf_names(model)
+        if repo_id in local_names or local_name in local_names:
+            continue
+        missing.append(model)
+    return missing
+
+
 def select(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry:
     """Resolve to exactly ONE model, shared by every entry point so they behave
     identically. A single match (given arg, or the sole model) returns straight
-    away. For several candidates the behaviour follows the environment, not the
-    caller: an interactive terminal prompts a numbered choice, with Enter
-    selecting the first model; without a tty (e.g. a server started in the
-    background) it lists them and raises, telling the user to pass --model. Zero
-    models always raises.
+    away. For several candidates, or when only downloadable defaults are
+    available, the behaviour follows the environment, not the caller: an
+    interactive terminal prompts a numbered choice, with Enter selecting the
+    first model; without a tty (e.g. a server started in the background) it
+    lists them and raises, telling the user to pass --model.
     """
     r = resolve(arg, root)
     if not isinstance(r, list):
         return r
 
     where = os.path.expanduser(root)
-    if not r:
+    downloads = _missing_default_models(r)
+    if not r and not downloads:
         raise FileNotFoundError(f"no models found under {where}")
 
-    lines = "\n".join(f"  [{i}] {e.name}" for i, e in enumerate(r))
+    labels = [e.name for e in r]
+    labels.extend(f"{_hf_names(model)[0]} (需下载)" for model in downloads)
+    lines = "\n".join(f"  [{i}] {label}" for i, label in enumerate(labels))
     if not sys.stdin.isatty():
         raise RuntimeError(
             f"multiple models under {where} — choose one with --model NAME:\n{lines}")
     print(lines)
-    raw = input(f"pick a model [0-{len(r) - 1}] (default 0): ").strip()
+    raw = input(f"pick a model [0-{len(labels) - 1}] (default 0): ").strip()
     if raw == "":
         raw = "0"
-    if not raw.isdigit() or not (0 <= int(raw) < len(r)):
+    if not raw.isdigit() or not (0 <= int(raw) < len(labels)):
         raise ValueError(f"invalid selection: {raw!r}")
-    return r[int(raw)]
+    index = int(raw)
+    if index < len(r):
+        return r[index]
+    return download_model(downloads[index - len(r)], root)

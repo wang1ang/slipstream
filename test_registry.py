@@ -1,3 +1,4 @@
+import builtins
 import importlib.util
 import sys
 from types import SimpleNamespace
@@ -117,3 +118,51 @@ def test_missing_huggingface_url_calls_snapshot_download_without_network(
     assert entry.name == "org--repo"
     assert entry.path == str(tmp_path / "org--repo")
     assert calls == [("org/repo", str(tmp_path / "org--repo"))]
+
+
+def test_interactive_selection_can_download_default_model(
+    monkeypatch, tmp_path, capsys
+):
+    calls = []
+    default_model = "org/default-model"
+
+    def fake_download(model, root=registry.DEFAULT_ROOT):
+        calls.append((model, root))
+        return registry.ModelEntry(
+            name="org--default-model",
+            path=str(tmp_path / "org--default-model"),
+        )
+
+    monkeypatch.setattr(registry, "DEFAULT_MODELS", (default_model,))
+    monkeypatch.setattr(registry, "download_model", fake_download)
+    monkeypatch.setattr(registry.sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(builtins, "input", lambda _prompt: "0")
+
+    entry = registry.select(None, root=str(tmp_path))
+
+    assert entry.name == "org--default-model"
+    assert calls == [(default_model, str(tmp_path))]
+    assert "org/default-model (需下载)" in capsys.readouterr().out
+
+
+def test_noninteractive_selection_marks_missing_default_models(
+    monkeypatch, tmp_path
+):
+    for name in ("a-model", "b-model"):
+        model_dir = tmp_path / name
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text("{}")
+
+    monkeypatch.setattr(registry, "DEFAULT_MODELS", ("org/default-model",))
+    monkeypatch.setattr(registry.sys, "stdin", SimpleNamespace(isatty=lambda: False))
+
+    try:
+        registry.select(None, root=str(tmp_path))
+    except RuntimeError as e:
+        message = str(e)
+    else:
+        raise AssertionError("expected noninteractive selection to fail")
+
+    assert "a-model" in message
+    assert "b-model" in message
+    assert "org/default-model (需下载)" in message

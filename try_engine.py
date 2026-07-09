@@ -24,7 +24,7 @@ from prompt_toolkit.document import Document
 
 from multiplex import registry
 from multiplex.engine import Engine
-from multiplex.mtp import Drafter, find_mtp
+from multiplex.mtp import find_drafter
 from multiplex.scheduler import Scheduler, Req, PrefillGroup
 
 
@@ -52,11 +52,10 @@ def main() -> int:
     args = ap.parse_args()
 
     entry = registry.select(args.model)
-    mtp = find_mtp(entry.path)
-    print(f"[loading {entry.name}{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
     eng = Engine(entry.path)
     tokenizer = eng.tokenizer
-    drafter = Drafter(eng, mtp) if mtp else None
+    drafter = find_drafter(eng)
+    print(f"[loaded {entry.name}{' + MTP head' if drafter else ' (headless, pure AR)'}]")
 
     debug_lines = []
 

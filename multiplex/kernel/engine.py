@@ -23,6 +23,7 @@ Correctness facts (verified by experiment):
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -32,6 +33,24 @@ import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import _make_cache
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+
+def _resolve_load_path(model_path: str) -> str:
+    """An MTPLX assistant-pair bundle has no config.json at its root — the
+    runnable text model lives under a subdirectory named by mtplx_pair.json's
+    ``layout.target`` (default ``target/``). Point the loader there. A plain
+    single-model directory (config.json at root) is returned unchanged."""
+    pair = os.path.join(model_path, "mtplx_pair.json")
+    if not os.path.isfile(pair):
+        return model_path
+    try:
+        layout = (json.load(open(pair)).get("layout") or {})
+    except (OSError, json.JSONDecodeError):
+        layout = {}
+    target = os.path.join(model_path, str(layout.get("target") or "target"))
+    if os.path.isfile(os.path.join(target, "config.json")):
+        return target
+    return model_path
 
 
 @dataclass
@@ -62,8 +81,15 @@ class Engine:
                 raise FileNotFoundError(f"model directory not found: {expanded}")
             model_path = expanded
         t0 = time.time()
-        self.model, self.tokenizer = load(model_path)
-        self.model_path = model_path
+        load_path = _resolve_load_path(model_path)
+        self.model, self.tokenizer = load(load_path)
+        # mlx-lm's multimodal wrappers (e.g. gemma4) expose the text stack under
+        # ``.language_model``; a plain text model (e.g. gemma4_text, used as the
+        # target of an assistant-pair bundle) IS the text stack. Alias it so the
+        # forward paths below can always go through ``.language_model``.
+        if not hasattr(self.model, "language_model"):
+            self.model.language_model = self.model
+        self.model_path = load_path
         self.load_seconds = time.time() - t0
 
     def logits(self, hidden: mx.array) -> mx.array:
