@@ -271,11 +271,27 @@ class Scheduler:
             state.lengths = list(lengths_before)
             commit_in = mx.array([[int(verify_in[i, 0])] + draft_ids[i][:m] for i in range(B)])
             h = eng.forward(state, commit_in)[:, -1:, :]
+        elif eng.has_rotating_cache(state):
+            # Sliding-window (rotating) attention trunk (e.g. Gemma): a rotating
+            # KV cache CANNOT be rolled back by a pointer trim. Its
+            # ``trim`` only rewinds the write index; the physical K/V buffer
+            # still holds the rejected tail, and repeated verify-then-trim
+            # rounds let that buffer drift from the K/V a clean forward would
+            # produce — a divergence that surfaces as a one-token phase shift in
+            # repeated-token stretches. So fully rewind the round and replay the
+            # committed prefix (primary + m accepted), rebuilding the rotating
+            # KV exactly. This mirrors the reference drafter, whose rollback
+            # cache replays the committed prefix rather than trimming in place.
+            eng.trim_attention(state, k + 1)
+            state.lengths = list(lengths_before)
+            commit_in = mx.array([[int(verify_in[i, 0])] + draft_ids[i][:m] for i in range(B)])
+            h = eng.forward(state, commit_in)[:, -1:, :]
         else:
-            # Pure-attention trunk (no SSM to replay): the verify pass already
-            # wrote the committed KV, so just drop the rejected tail (k - m
-            # positions) and take the committed hidden straight from vhidden.
-            # Re-forwarding here would double-append the committed tokens.
+            # Pure-attention trunk (no SSM, non-rotating KV): the verify pass
+            # already wrote the committed KV, so just drop the rejected tail
+            # (k - m positions) and take the committed hidden straight from
+            # vhidden. Re-forwarding here would double-append the committed
+            # tokens.
             eng.trim_attention(state, k - m)
             state.lengths = [n + m + 1 for n in lengths_before]
             h = vhidden[:, m:m + 1, :]

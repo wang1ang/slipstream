@@ -152,6 +152,19 @@ class Engine:
             if s is not None:
                 c.cache = [None if v is None else v + 0 for v in s]
 
+    def has_rotating_cache(self, state: BatchState) -> bool:
+        """True if any attention layer uses a sliding-window (rotating) KV cache.
+
+        A rotating cache reuses a fixed-size ring buffer and its ``trim`` only
+        rewinds the write index — it does NOT restore the buffer contents. So a
+        rejected speculative tail cannot be rolled back by trimming; the round
+        must instead be fully rewound and the committed prefix replayed."""
+        from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
+        return any(
+            isinstance(c, (BatchRotatingKVCache, RotatingKVCache))
+            for c in state.cache
+        )
+
     def trim_attention(self, state: BatchState, n: int) -> None:
         """Trim n positions off every attention (KVCache) layer. SSM layers are
         left untouched — restore them with restore_ssm()."""
