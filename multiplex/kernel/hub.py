@@ -24,7 +24,7 @@ import time
 
 from ..bridge import ThinkingParser, normalize_messages_for_template
 from .engine import Engine
-from .mtp import Drafter
+from .mtp import find_drafter
 from .scheduler import Scheduler, Req, PrefillGroup
 
 
@@ -292,9 +292,10 @@ class Hub:
         self.eng = Engine(c["model_path"])
         self.tokenizer = self.eng.tokenizer
         self._requests = RequestManager(self._decode)
-        # No MTP head path -> run pure AR (scheduler forces k=0).
-        self.drafter = (Drafter(self.eng, c["mtp_path"])
-                        if c["mtp_path"] is not None else None)
+        # Build the architecture-specific head before wrapping it in the
+        # model-agnostic Drafter.  The configured path may be an explicit
+        # --mtp override; without one, find_drafter also handles pair bundles.
+        self.drafter = find_drafter(self.eng, c["mtp_path"])
         self._sched = Scheduler(self.eng, self.drafter,
                                 eos_token_ids=self.tokenizer.eos_token_ids,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"],

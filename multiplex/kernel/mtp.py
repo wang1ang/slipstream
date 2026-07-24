@@ -562,7 +562,7 @@ class Drafter:
         return mx.concatenate(drafts, axis=1)
 
 
-def find_drafter(engine):
+def find_drafter(engine, mtp_path: str | None = None):
     """Build the right MTP drafter for a loaded model, or None for pure AR.
 
     Unified entry point over the drafter zoo: it picks a head builder by what the
@@ -572,7 +572,9 @@ def find_drafter(engine):
       * ``mtp.safetensors`` sidecar  -> Qwen native MTP head (build_qwen_head)
       * assistant-pair bundle        -> Gemma external drafter (build_gemma_head)
     """
-    mtp_path = find_mtp(engine.model_path)
+    # ``mtp_path`` is normally discovered beside the model, but the server's
+    # --mtp option may point at a sidecar stored elsewhere.
+    mtp_path = mtp_path or find_mtp(engine.model_path)
     if mtp_path is not None:
         return Drafter(engine, build_qwen_head(engine, mtp_path))
 
